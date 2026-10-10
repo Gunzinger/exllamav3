@@ -102,6 +102,38 @@ class RMSNorm(Module):
             x.shape[-1] % 4 == 0
         )
 
+    def _forward_cpu(
+        self,
+        x: torch.Tensor,
+        dtype: torch.dtype,
+        residual: torch.Tensor | None,
+        residual_in: torch.Tensor | None,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        res_out = residual
+        if self.span_heads:
+            x = x.flatten(-2)
+            if residual is not None: residual = residual.flatten(-2)
+            if residual_in is not None: residual_in = residual_in.flatten(-2)
+        x_2d = x.reshape(-1, x.shape[-1])
+        if residual_in is not None:
+            r_2d = residual_in.view(-1, residual_in.shape[-1])
+            r_2d += x_2d
+            x_2d = r_2d
+        xf = x_2d.float()
+        rmf = torch.rsqrt(xf.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps) * self.constant_scale
+        y = xf * rmf
+        if not self.unweighted:
+            w = self.weight
+            if self.groups > 1:
+                w = w.view(self.groups, -1)[torch.arange(x_2d.shape[0], device = x.device) % self.groups]
+            y = y * (w.float() + self.constant_bias)
+        if residual is not None:
+            res_2d = residual.view(-1, residual.shape[-1])
+            res_2d.copy_((res_2d.float() + y).to(residual.dtype))
+            return res_out
+        return y.to(dtype or x.dtype).view(orig_shape)
+
     @override
     def forward(
         self,
@@ -113,8 +145,10 @@ class RMSNorm(Module):
     ) -> torch.Tensor:
         dtype = out_dtype or self.out_dtype
 
-        # Fused pre-norm residual: residual_in += x (in place), y = norm(residual_in)
-        if residual_in is not None:
+        if x.device.type == "cpu":
+            y = self._forward_cpu(x, dtype, residual, residual_in)
+        elif residual_in is not None:
+            # Fused pre-norm residual: residual_in += x (in place), y = norm(residual_in)
             x_2d = x.view(-1, x.shape[-1])
             r_2d = residual_in.view(-1, residual_in.shape[-1])
             y_2d = torch.empty_like(x_2d, dtype = dtype)
