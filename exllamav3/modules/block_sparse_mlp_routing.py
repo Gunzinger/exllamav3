@@ -83,28 +83,66 @@ def _gate_t(cfg):
     projection leave the int8 slices unset and route on the half gate."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
+    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half \
+            and cfg.gate_tensor_t.device.type == "cuda":
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)
         ext.det_quant_weight(cfg.gate_tensor_t, cfg.gate_i8, cfg.gate_sb)
     return cfg.gate_tensor_t
 
+
+def _routing_std_torch(cfg, y, router_logits, selected_experts, routing_weights, bias = None):
+    """CPU mirror of ext.routing_std (routing.cu, routing_std_topk_kernel): fp32-accumulated
+    logits stored half, top-k on the (optionally biased) logits, weights = softmax over the
+    selected set only (norm_topk_prob), per_expert_scale applied after the normalization,
+    outputs int64 indices and half weights."""
+    logits = torch.matmul(y.float(), cfg.gate_tensor.float()).half()
+    if router_logits is not None:
+        router_logits.copy_(logits)
+    l = logits.float()
+    if bias is not None:
+        l = l + bias.float()
+    top = l.topk(cfg.num_experts_per_tok, dim = -1)
+    e = (top.values - top.values.max(dim = -1, keepdim = True).values).exp()
+    w = e / (e.sum(dim = -1, keepdim = True) + 1e-20)
+    if cfg.per_expert_scale is not None:
+        w = w * cfg.per_expert_scale[top.indices].float()
+    selected_experts.copy_(top.indices)
+    routing_weights.copy_(w.half())
+
+
+def _routing_sel_norm_torch(cfg, y, selected_experts, routing_weights, scaling_factor, act):
+    """CPU mirror of ext.routing_sel_norm: weights = act(logits[selected]) normalized over the
+    selection, times scaling_factor (act: ROUTING_ACT_SIGMOID / ROUTING_ACT_SQRTSP)"""
+    logits = torch.matmul(y.float(), cfg.gate_tensor.float()).half().float()
+    o = logits.gather(1, selected_experts)
+    if act == ROUTING_ACT_SQRTSP:
+        o = F.softplus(o).sqrt()
+    else:
+        o = o.sigmoid()
+    o = o * scaling_factor / (o.sum(dim = -1, keepdim = True) + 1e-20)
+    routing_weights.copy_(o.half())
+
 def routing_std(bsz, cfg, y, params):
     if bsz == 1:
-        _gate_t(cfg)
-        ext.routing_std(
-            y,
-            cfg.gate_tensor,
-            cfg.router_logits_bsz1,
-            cfg.selected_experts_bsz1,
-            cfg.routing_weights_bsz1,
-            cfg.per_expert_scale,
-            cfg.gate_tensor_t,
-            None,
-            cfg.gate_i8,
-            cfg.gate_sb,
-        )
+        if y.device.type == "cpu":
+            _routing_std_torch(cfg, y, cfg.router_logits_bsz1,
+                               cfg.selected_experts_bsz1, cfg.routing_weights_bsz1)
+        else:
+            _gate_t(cfg)
+            ext.routing_std(
+                y,
+                cfg.gate_tensor,
+                cfg.router_logits_bsz1,
+                cfg.selected_experts_bsz1,
+                cfg.routing_weights_bsz1,
+                cfg.per_expert_scale,
+                cfg.gate_tensor_t,
+                None,
+                cfg.gate_i8,
+                cfg.gate_sb,
+            )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
         activate_all_experts = params.get("activate_all_experts")
@@ -120,19 +158,22 @@ def routing_std(bsz, cfg, y, params):
             return selected_experts, routing_weights
         else:
             router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
-            _gate_t(cfg)
-            ext.routing_std(
-                y,
-                cfg.gate_tensor,
-                router_logits,
-                selected_experts,
-                routing_weights,
-                cfg.per_expert_scale,
-                cfg.gate_tensor_t,
-                None,
-                cfg.gate_i8,
-                cfg.gate_sb,
-            )
+            if y.device.type == "cpu":
+                _routing_std_torch(cfg, y, router_logits, selected_experts, routing_weights)
+            else:
+                _gate_t(cfg)
+                ext.routing_std(
+                    y,
+                    cfg.gate_tensor,
+                    router_logits,
+                    selected_experts,
+                    routing_weights,
+                    cfg.per_expert_scale,
+                    cfg.gate_tensor_t,
+                    None,
+                    cfg.gate_i8,
+                    cfg.gate_sb,
+                )
         return selected_experts, routing_weights
 
 
@@ -151,25 +192,29 @@ def routing_std_bias(bsz, cfg, y, params):
             .repeat((bsz, 1))
         )
         return selected_experts, routing_weights
-    # Every batch size on the deterministic ext path (bias before top-k inside the kernel)
-    _gate_t(cfg)
+    # Every batch size on the deterministic ext path (bias before top-k inside the kernel);
+    # CPU tensors take the torch mirror (bias before top-k here as well)
     if bsz == 1:
         router_logits, selected_experts, routing_weights = \
             cfg.router_logits_bsz1, cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     else:
         router_logits, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
-    ext.routing_std(
-        y,
-        cfg.gate_tensor,
-        router_logits,
-        selected_experts,
-        routing_weights,
-        cfg.per_expert_scale,
-        cfg.gate_tensor_t,
-        cfg.router_bias,
-        cfg.gate_i8,
-        cfg.gate_sb,
-    )
+    if y.device.type == "cpu":
+        _routing_std_torch(cfg, y, router_logits, selected_experts, routing_weights, cfg.router_bias)
+    else:
+        _gate_t(cfg)
+        ext.routing_std(
+            y,
+            cfg.gate_tensor,
+            router_logits,
+            selected_experts,
+            routing_weights,
+            cfg.per_expert_scale,
+            cfg.gate_tensor_t,
+            cfg.router_bias,
+            cfg.gate_i8,
+            cfg.gate_sb,
+        )
     return selected_experts, routing_weights
 
 
@@ -423,12 +468,16 @@ def routing_sqrtsp_hash(bsz, cfg, y, params):
         hash_sel = to_device(cfg.tid2eid[safe_ids], y.device).long()
         return _routing_sqrtsp_vl(cfg, y, vl, hash_sel)
     selected_experts = to_device(cfg.tid2eid[input_ids], y.device).long()
-    _gate_t(cfg)
     if bsz == 1:
         routing_weights = cfg.routing_weights_bsz1
         router_logits = cfg.router_logits_bsz1
     else:
         router_logits, _, routing_weights = _routing_buffers(cfg, bsz, y.device)
+    if y.device.type == "cpu":
+        _routing_sel_norm_torch(cfg, y, selected_experts, routing_weights,
+                                cfg.routed_scaling_factor, ROUTING_ACT_SQRTSP)
+        return selected_experts, routing_weights
+    _gate_t(cfg)
     ext.routing_sel_norm(
         y,
         cfg.gate_tensor,

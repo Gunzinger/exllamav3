@@ -840,6 +840,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
+        elif device is not None and torch.device(device).type == "cpu":
+            # CPU-only device path (plan A3): no BC/graph/fused machinery, the in-process
+            # moe_mul1 expert kernel registered by load_local_cpu instead
+            self.load_local_cpu(**kwargs)
+            self.load_routing(**kwargs)
 
 
     def _batch_recon_layer(self, y):
@@ -1011,6 +1016,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        if self.cpu_layer:
+            return self.cpu_forward(x, params, out_dtype)
 
         if self.alt_residual_channel:
             y = params["residual"].view(-1, self.hidden_size)
