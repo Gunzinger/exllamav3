@@ -51,10 +51,14 @@ class LinearFP16:
             w.copy_(self.weight)
             self.weight = w
 
-        self.bc = ext.BC_LinearFP16(
-            self.weight,
-            self.bias,
-        )
+        if self.weight.device.type == "cpu":
+            # BC (CUDA graph buffer collection) is CUDA-only; the CPU forward is plain torch
+            self.bc = None
+        else:
+            self.bc = ext.BC_LinearFP16(
+                self.weight,
+                self.bias,
+            )
 
     def unload(self):
         pass
@@ -92,6 +96,9 @@ class LinearFP16:
             weight.copy_(pinned, non_blocking = True)
         if dtype == x.dtype:
             torch.matmul(x, weight, out = y)
+        elif x.device.type == "cpu":
+            # hgemm semantics: half inputs, fp32 accumulation, out per out_dtype
+            torch.matmul(x.float(), weight.float(), out = y)
         else:
             ext.hgemm(x, weight, y)
         if self.bias is not None:

@@ -82,17 +82,23 @@ class LinearEXL3:
 
         self._fused_reconstruct = None
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
-        # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
-        self.bc = ext.BC_LinearEXL3(
-            self.trellis,
-            self.suh,
-            self.svh,
-            self.K,
-            self.bias,
-            self.mcg,
-            self.mul1,
-            g_tensor_cache.get(*self.bsz1_xh_args)
-        )
+        # BC (CUDA graph buffer collection) and the g_tensor_cache workspace it borrows are
+        # CUDA-only; the CPU forward runs the moe_mul1 kernels directly
+        self.is_cpu = self.trellis.device.type == "cpu"
+        if self.is_cpu:
+            self.bc = None
+        else:
+            # K is the bitrate (int, or float for the half-integer rates); the C++ side decomposes it
+            self.bc = ext.BC_LinearEXL3(
+                self.trellis,
+                self.suh,
+                self.svh,
+                self.K,
+                self.bias,
+                self.mcg,
+                self.mul1,
+                g_tensor_cache.get(*self.bsz1_xh_args)
+            )
 
 
     def unload(self):
@@ -133,6 +139,16 @@ class LinearEXL3:
         # responsible for contiguity (a silent copy here would hide a hot-path inefficiency
         # and break CUDA-graph address stability)
         assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
+
+        if x.device.type == "cpu":
+            if params.get("reconstruct"):
+                raise NotImplementedError(f"LinearEXL3 {self.key}: reconstruct is not supported on CPU")
+            assert self.mul1, \
+                f"LinearEXL3 {self.key}: CPU forward supports the mul1 codebook only (mcg is unsupported)"
+            dtype = out_dtype or self.default_out_dtype
+            return ext.exl3_cpu_linear_forward(
+                self.trellis, self.suh, self.svh, self.K, self.bias, x, dtype == torch.float
+            )
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:
