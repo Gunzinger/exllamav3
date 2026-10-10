@@ -52,14 +52,17 @@ class GatedRMSNorm(Module):
         self._numel = weight.numel()
         self.weight = nn.Parameter(weight, requires_grad = False)
 
-        self.bc = ext.BC_GatedRMSNorm(
-            self.weight,
-            self.rms_norm_eps,
-            self.constant_bias,
-            self.groups,
-            self.gate_first,
-            1 if self.gate_activation == "sigmoid" else 0,
-        )
+        if device.type == "cuda":
+            self.bc = ext.BC_GatedRMSNorm(
+                self.weight,
+                self.rms_norm_eps,
+                self.constant_bias,
+                self.groups,
+                self.gate_first,
+                1 if self.gate_activation == "sigmoid" else 0,
+            )
+        else:
+            self.bc = None
 
     @override
     def unload(self):
@@ -100,6 +103,28 @@ class GatedRMSNorm(Module):
     def weights_numel(self):
         return self._numel
 
+    def _forward_cpu(
+        self,
+        x: torch.Tensor,
+        out_dtype: torch.dtype | None,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        gate_fn = torch.sigmoid if self.gate_activation == "sigmoid" else F.silu
+        orig_shape = x.shape
+        h = x.reshape(-1, orig_shape[-1]).float()
+        g = gate.reshape(-1, orig_shape[-1]).float()
+        if self.gate_first:
+            h = h * gate_fn(g)
+        rmf = torch.rsqrt(h.pow(2).mean(dim = -1, keepdim = True) + self.rms_norm_eps)
+        h = h * rmf
+        w = self.weight
+        if self.groups > 1:
+            w = w.view(self.groups, -1)[torch.arange(h.shape[0], device = x.device) % self.groups]
+        h = h * (w.float() + self.constant_bias)
+        if not self.gate_first:
+            h = h * gate_fn(g)
+        return h.to(out_dtype or self.out_dtype or x.dtype).view(orig_shape)
+
     @override
     def forward(
         self,
@@ -109,6 +134,8 @@ class GatedRMSNorm(Module):
         gate: torch.Tensor = None,
     ) -> torch.Tensor:
         gate_act = 1 if self.gate_activation == "sigmoid" else 0
+        if x.device.type == "cpu":
+            return self._forward_cpu(x, out_dtype, gate)
         if gate_act and not (x.dtype == torch.bfloat16 and x.is_contiguous() and gate.is_contiguous()):
             # KDA torch fallback: strict-fp32 norm and weight, sigmoid gate after the norm
             h = x.to(torch.float32)

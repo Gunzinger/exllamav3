@@ -501,6 +501,90 @@ class RoPE:
         return freqs_t.contiguous(), next_pos_idx
 
 
+    def _apply_cpu(
+        self,
+        q: torch.Tensor,
+        out_q: torch.Tensor,
+        k: torch.Tensor | None,
+        out_k: torch.Tensor | None,
+        position: int,
+        positions: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        q_norm: torch.Tensor | None,
+        k_norm: torch.Tensor | None,
+        norm_eps: float,
+        norm_constant_bias: float,
+        inv_freq: torch.Tensor,
+    ):
+        assert q.dtype == torch.half, "rope: q must be half"
+        bsz, qlen = q.shape[:2]
+        style = self.rope_settings.rope_style
+        rd2 = inv_freq.size(-1)
+        rd = rd2 * 2
+        rotate_dims = self.rope_settings.rotate_dims
+        table = inv_freq.dim() > 1
+
+        if positions is not None:
+            pos = torch.arange(qlen, device = q.device).unsqueeze(0) + positions.long().unsqueeze(1)
+        elif position_ids is not None:
+            pos = position_ids.long()
+            assert pos.dim() in (2, 3)
+        else:
+            pos = (position + torch.arange(qlen, device = q.device)).unsqueeze(0)
+        if pos.dim() == 2: pos = pos.unsqueeze(-1)
+        per_rdim = pos.shape[-1] > 1
+
+        if table:
+            tab = inv_freq.reshape(-1, rd2).float()
+            rows = torch.arange(bsz, device = q.device).view(bsz, 1, 1) * inv_freq.size(-2) + pos
+            ang = tab[rows]
+        else:
+            ang = pos.float().unsqueeze(-1) * inv_freq.view(rd2)
+        sin_all = torch.sin(ang) * self.attn_factor
+        cos_all = torch.cos(ang) * self.attn_factor
+
+        def norm_head(h: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            f = h.float()
+            rmf = torch.rsqrt(f.pow(2).mean(dim = -1, keepdim = True) + norm_eps)
+            f = f * rmf
+            if w.dtype == torch.bfloat16:
+                return (f * (w.float() + norm_constant_bias)).to(torch.half)
+            return f.to(torch.half) * (w + norm_constant_bias)
+
+        def rotate(dst: torch.Tensor, src: torch.Tensor, rdim: int):
+            sin = (sin_all[:, :, rdim] if per_rdim else sin_all[:, :, 0]).unsqueeze(2)
+            cos = (cos_all[:, :, rdim] if per_rdim else cos_all[:, :, 0]).unsqueeze(2)
+            off = rd * rdim
+            if style == RopeStyle.NEOX:
+                f = src[..., off : off + rd].float()
+                a = f[..., : rd2]
+                b = f[..., rd2:]
+                dst[..., off : off + rd2] = (a * cos - b * sin).to(torch.half)
+                dst[..., off + rd2 : off + rd] = (b * cos + a * sin).to(torch.half)
+            else:
+                f = src[..., off : off + rd].float()
+                a = f[..., 0::2]
+                b = f[..., 1::2]
+                sec = dst[..., off : off + rd].view(*dst.shape[:-1], rd2, 2)
+                sec[..., 0] = (a * cos - b * sin).to(torch.half)
+                sec[..., 1] = (b * cos + a * sin).to(torch.half)
+
+        def rope_one(src: torch.Tensor, dst: torch.Tensor, norm_w):
+            x = norm_head(src, norm_w) if norm_w is not None else src
+            for rdim in range(rotate_dims):
+                rotate(dst, x, rdim)
+
+        rope_one(q, out_q, q_norm)
+        if k is not None:
+            assert k.dtype == torch.half, "rope: k must be half"
+            rope_one(k, out_k, k_norm)
+
+        if self.llama_4_scaling_beta > 0.0:
+            pos0 = pos[:, :, 0].flatten()
+            scaling = 1.0 + self.llama_4_scaling_beta * torch.log1p(
+                (pos0 // self.llama_4_scaling_original).float())
+            out_q.copy_((out_q.float() * scaling.view(bsz, qlen, 1, 1)).to(torch.half))
+
     def apply(
         self,
         q: torch.Tensor,
@@ -508,7 +592,7 @@ class RoPE:
         position: int = 0,
         positions: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
-        in_place = False,
+        in_place: bool = False,
         q_norm: torch.Tensor | None = None,
         k_norm: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
@@ -534,25 +618,39 @@ class RoPE:
             out_q = q
             out_k = k
 
-        ext.rope(
-            q, out_q,
-            k, out_k,
-            self.inv_freq if inv_freq is None else inv_freq,
-            position,
-            positions,
-            position_ids,
-            self.rope_settings.rope_style,
-            self.attn_factor,
-            q_norm,
-            k_norm,
-            norm_eps,
-            norm_constant_bias,
-            self.llama_4_scaling_beta,
-            self.llama_4_scaling_original,
-            self.rope_settings.rotate_dims,
-            0,
-        )
-            
+        if q.device.type == "cpu":
+            self._apply_cpu(
+                q, out_q,
+                k, out_k,
+                position,
+                positions,
+                position_ids,
+                q_norm,
+                k_norm,
+                norm_eps,
+                norm_constant_bias,
+                self.inv_freq if inv_freq is None else inv_freq,
+            )
+        else:
+            ext.rope(
+                q, out_q,
+                k, out_k,
+                self.inv_freq if inv_freq is None else inv_freq,
+                position,
+                positions,
+                position_ids,
+                self.rope_settings.rope_style,
+                self.attn_factor,
+                q_norm,
+                k_norm,
+                norm_eps,
+                norm_constant_bias,
+                self.llama_4_scaling_beta,
+                self.llama_4_scaling_original,
+                self.rope_settings.rotate_dims,
+                0,
+            )
+
         if squeeze:
             out_q = out_q.squeeze(0)
             out_k = out_k.squeeze(0) if out_k is not None else None

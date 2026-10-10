@@ -30,7 +30,10 @@ def hc_flush(params: dict):
         x, y, post, comb = p
         b, s, H, D = x.shape
         R = b * s
-        ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
+        if x.device.type == "cuda":
+            ext.hc_apply(x.view(R, H, D), y.view(R, D), post.view(R, H), comb.view(R, H, H), None, None)
+        else:
+            x.copy_(post.unsqueeze(-1) * y.float().unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), x))
 
 # mHC (manifold-constrained hyper-connections, DeepSeek-V4): the residual is carried as
 # hc_mult parallel fp32 streams shaped (bsz, seq, hc_mult, hidden). ExpandStreams broadcasts
@@ -160,7 +163,7 @@ class HyperConnection(Module):
             hc_flush(params)
             pend = None
         if _hc_fold and hc == 4 and b * s <= _HC_FOLD_MAX_R and streams.dtype == torch.float and D % 4 == 0 \
-                and streams.is_contiguous():
+                and streams.is_contiguous() and streams.device.type == "cuda":
             fold_norm = norm is not None and self._fold_norm_ok(norm, D)
             if pend is not None or fold_norm:
                 params.pop("hc_pending", None)
@@ -200,7 +203,8 @@ class HyperConnection(Module):
     def _mix_unfused(self, streams: torch.Tensor, params: dict):
         hc = self.hc_mult
         b, s, H, D = streams.shape
-        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous():
+        if hc == 4 and streams.dtype == torch.float and D % 4 == 0 and streams.is_contiguous() \
+                and streams.device.type == "cuda":
             R = b * s
             st = streams.view(R, H, D)
             chunks = ext.hc_mix_num_chunks(R, H * D)
@@ -260,7 +264,8 @@ class HyperConnection(Module):
         hc_flush(params)
         if not converting and H == 4 and x.dtype == torch.float and x.is_contiguous() and D % 4 == 0 \
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() \
-                and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous():
+                and post.dtype == torch.float and post.is_contiguous() and comb.is_contiguous() \
+                and x.device.type == "cuda":
             R = b * s
             # ROCm, decode rows: hand the update to the next site's mix (mix_norm), which runs it inside its
             # partials kernel. Not while states are exported or under TP, where other readers see the streams
@@ -416,7 +421,7 @@ class GatedResidual(Module):
         # instructions — so on CUDA the path is Ampere+ only (ROCm runs it on RDNA's int8
         # WMMA, rocm/det_gemm_rocm.cuh); elsewhere the cuBLAS fallback serves the projection.
         self.tiled = _gr_mix_tiled_enable and H == 4 and Dh % 128 == 0 and self.rank % 64 == 0 \
-            and Mpad <= 512 and ext.HAS_GR_MIX_TILED and dev.type == "cuda" \
+            and Mpad <= 512 and dev.type == "cuda" and ext.HAS_GR_MIX_TILED \
             and torch.cuda.get_device_capability(dev)[0] >= 8
         self.up_h = up.half().contiguous()          # (H * D, rank), checkpoint orientation
         # up repacked (H, D/4, rank, 4) so the fused kernel's rank loop reads lane-contiguous
@@ -542,6 +547,9 @@ class GatedResidual(Module):
         if not s3.is_contiguous():
             s3 = s3.contiguous()
         dev = s3.device
+        if dev.type == "cpu":
+            post, mixed = self._mix_ref(s3)
+            return post, mixed.half()
         xw = self._weighted_copy(s3, params)
 
         if R <= self.FUSED_MAX_R:
@@ -624,6 +632,9 @@ class GatedResidual(Module):
         if y2.dtype not in (torch.half, torch.float):
             y2 = y2.half()
         x3 = x.view(R, self.hc_mult, self.hidden_size)
+        if x.device.type != "cuda":
+            x3 += post.reshape(R, self.hc_mult, 1).float() * y2.reshape(R, 1, self.hidden_size).float()
+            return x
         # Decode-class rows: also emit the successor's weighted stream copy for its fused mix
         # (the prefill path applies the weight itself). Same static bucket for every site on
         # the device: the copy is consumed by the very next mix on the stream.
@@ -800,7 +811,7 @@ class HyperHead(Module):
         if self.mean:
             return x.mean(dim = 2)
         b, s, H, D = x.shape
-        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous():
+        if H == 4 and x.dtype == torch.float and D % 4 == 0 and x.is_contiguous() and x.device.type == "cuda":
             R = b * s
             chunks = ext.hc_mix_num_chunks(R, H * D)
             # Decode-class row counts take the static workspaces (same rule as _mix); prefill
