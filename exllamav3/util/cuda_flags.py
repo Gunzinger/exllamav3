@@ -55,6 +55,37 @@ HIP_EXCLUDED_SOURCES = {
 }
 
 
+# Translation units of the CPU-only extension variant (no CUDA/HIP toolchain involved): the pure-C++
+# kernels, the CPU bindings module and the CUDA-runtime stand-ins stloader.cpp links against. The
+# Python surface of this variant is the subset bindings_cpu.cpp registers, plus HAS_* flags set
+# false for every GPU-only kernel family.
+CPU_SOURCES = [
+    "cpu_compat/cuda_stub.cpp",
+    "cpu/moe_mul1.cpp",
+    "avx2_target.cpp",
+    "avx512_target.cpp",
+    "hadamard.cpp",
+    "sam.cpp",
+    "stloader.cpp",
+    "bindings_cpu.cpp",
+]
+
+
+def cpu_extension_sources(sources_dir: str) -> list[str]:
+    """Absolute paths of the extension's translation units for a CPU-only build (torch without a
+    CUDA or HIP runtime, or EXLLAMA_FORCE_CPU)."""
+    base = os.path.abspath(sources_dir)
+    return [os.path.join(base, rel) for rel in CPU_SOURCES]
+
+
+def cpu_compat_include_dir(sources_dir: str) -> str:
+    """Include directory of the CPU-only build's header stand-ins (cpu_compat/): a stub
+    cuda_runtime.h plus shadows of the c10/ATen CUDA headers stloader.cpp includes. cpp_extension
+    places extra_include_paths (-I) ahead of torch's own (-isystem), so passing this directory
+    makes those includes resolve to the stand-ins."""
+    return os.path.join(os.path.abspath(sources_dir), "cpu_compat")
+
+
 def is_hipify_output(filename: str) -> bool:
     """
     Files torch's hipify writes next to the sources on ROCm builds (foo.cu -> foo.hip, foo.cpp ->
