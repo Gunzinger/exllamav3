@@ -46,3 +46,19 @@ def silu_oai_mul(x, y, z, act_limit = 0.0):
         g = g.clamp(max = act_limit)
         u = u.clamp(-act_limit, act_limit)
     z.copy_((u + 1.0) * g * torch.sigmoid(1.702 * g))
+
+
+# x *= sigmoid(y); full-gate form (same shape) and headwise-broadcast form (y one dim shorter)
+
+def mul_sigmoid_(x, y):
+    if x.device.type == "cuda":
+        ext.mul_sigmoid_(x, y)
+        return
+    x.mul_(torch.sigmoid(y))
+
+
+def mul_sigmoid_broadcast_(x, y):
+    if x.device.type == "cuda":
+        ext.mul_sigmoid_broadcast_(x, y)
+        return
+    x.mul_(torch.sigmoid(y).unsqueeze(-1))

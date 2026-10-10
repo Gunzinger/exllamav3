@@ -2,7 +2,7 @@ import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
-from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
+from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache, fn_torch_sdpa_cpu_paged
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
 try:
     from .triton_paged import (
@@ -54,7 +54,9 @@ else:
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
-attn_fns: list[AttnFn] = _fns_triton_fast + _fns_triton_legacy + [
+# The CPU paged-cache fn leads the list: it declines non-CPU tensors, so CUDA/HIP dispatch is
+# unchanged, while a CPU-only load resolves here instead of falling off the end of the list
+attn_fns: list[AttnFn] = [fn_torch_sdpa_cpu_paged] + _fns_triton_fast + _fns_triton_legacy + [
     fn_bighead_scalar_attn,
     fn_xformers_cutlass_fallback_cache,
     fn_xformers_cutlass_fallback_nocache,

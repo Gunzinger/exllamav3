@@ -95,7 +95,12 @@ class LinearFP16:
             weight = g_tensor_cache.get_bucketed(x.device, pinned.numel(), pinned.dtype, "fp16_pin_stage").view(pinned.shape)
             weight.copy_(pinned, non_blocking = True)
         if dtype == x.dtype:
-            torch.matmul(x, weight, out = y)
+            if x.device.type == "cpu" and dtype == torch.half:
+                # torch's CPU fp16 GEMM is a scalar fallback, ~1000x slower than the fp32 GEMM;
+                # fp32 accumulation is the hgemm semantic anyway (copy_ casts)
+                y.copy_(torch.matmul(x.float(), weight.float()))
+            else:
+                torch.matmul(x, weight, out = y)
         elif x.device.type == "cpu":
             # hgemm semantics: half inputs, fp32 accumulation, out per out_dtype
             torch.matmul(x.float(), weight.float(), out = y)

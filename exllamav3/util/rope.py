@@ -573,6 +573,11 @@ class RoPE:
             x = norm_head(src, norm_w) if norm_w is not None else src
             for rdim in range(rotate_dims):
                 rotate(dst, x, rdim)
+            # The kernel norms the whole head and rotates only the rotary width; the
+            # pass-through tail must land in dst too (aliasing src, this is a no-op copy)
+            tail = rd * rotate_dims
+            if tail < src.shape[-1]:
+                dst[..., tail:] = x[..., tail:]
 
         rope_one(q, out_q, q_norm)
         if k is not None:
