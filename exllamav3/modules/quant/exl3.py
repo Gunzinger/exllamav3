@@ -146,9 +146,11 @@ class LinearEXL3:
             assert self.mul1, \
                 f"LinearEXL3 {self.key}: CPU forward supports the mul1 codebook only (mcg is unsupported)"
             dtype = out_dtype or self.default_out_dtype
-            return ext.exl3_cpu_linear_forward(
-                self.trellis, self.suh, self.svh, self.K, self.bias, x, dtype == torch.float
+            y = ext.exl3_cpu_linear_forward(
+                self.trellis, self.suh, self.svh, self.K, self.bias,
+                x.view(-1, self.in_features), dtype == torch.float
             )
+            return y.view(x.shape[:-1] + (self.out_features,))
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:
