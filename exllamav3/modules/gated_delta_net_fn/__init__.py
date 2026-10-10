@@ -1,3 +1,5 @@
+from .cpu import causal_conv1d_update_cpu, gdn_fused_op_cpu, gdn_fused_op_2_cpu
+
 try:
     from .conv1d import causal_conv1d_update
 except ModuleNotFoundError:

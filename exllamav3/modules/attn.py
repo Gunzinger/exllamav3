@@ -11,6 +11,7 @@ from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from ..util import activation as act
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
@@ -647,7 +648,7 @@ class Attention(Module):
         if self.multi_qg is None or bsz * q_len > 32:
             q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
-                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                if q.is_cuda and self.head_dim % 8 == 0 and q.dtype == torch.half:
                     qg = q
                     q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
                     g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
@@ -945,9 +946,9 @@ class Attention(Module):
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
-            else: ext.mul_sigmoid_broadcast_(o, g)
+            else: act.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate or self.interleaved_gate: act.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -961,7 +962,7 @@ class Attention(Module):
         """
         from ..cache import CacheLayer
 
-        if cache is None or x.dtype != torch.float16 or not x.is_contiguous():
+        if x.device.type == "cpu" or cache is None or x.dtype != torch.float16 or not x.is_contiguous():
             return None
         if params.get("sim_kvq") is not None:
             return None
@@ -1208,9 +1209,9 @@ class Attention(Module):
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
-            else: ext.mul_sigmoid_broadcast_(o, g)
+            else: act.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate or self.interleaved_gate: act.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
