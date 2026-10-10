@@ -62,6 +62,7 @@ HIP_EXCLUDED_SOURCES = {
 CPU_SOURCES = [
     "cpu_compat/cuda_stub.cpp",
     "cpu/moe_mul1.cpp",
+    "cpu/linear_mul1.cpp",
     "avx2_target.cpp",
     "avx512_target.cpp",
     "hadamard.cpp",

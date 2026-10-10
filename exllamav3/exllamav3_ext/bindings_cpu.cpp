@@ -70,6 +70,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("relu_mul", [act_stub](const at::Tensor&, const at::Tensor&, at::Tensor&, float) { act_stub("relu_mul"); }, "relu_mul");
 
     // [agent B] exl3_cpu_linear_forward lands here
+    #include "cpu/linear_mul1.h"
+    m.def("exl3_cpu_linear_forward", &exl3_cpu_linear_forward, "exl3_cpu_linear_forward",
+          py::call_guard<py::gil_scoped_release>());
 
     #include "sam_bc.h"
 }

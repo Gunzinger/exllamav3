@@ -3179,6 +3179,184 @@ void exl3_moe_cpu_forward
     );
 }
 
+// -------------------------------------------------------------------------------------------
+//   Standalone dense-linear forward (cpu/linear_mul1.cpp): one MoeCpuMatrix end to end
+// -------------------------------------------------------------------------------------------
+
+namespace {
+
+struct LinearArena
+{
+    std::vector<float> tin, tout;
+    std::vector<int32_t> splat, splat_dup;
+    std::vector<PreparedIn> prep;
+
+    static LinearArena& get()
+    {
+        static thread_local LinearArena arena;
+        return arena;
+    }
+};
+
+struct LinearCtx
+{
+    const MoeCpuMatrix* mat;
+    const at::Half* x;
+    float* out;
+    int m_total;
+    int row0;
+    int nc;
+    float* tout;
+    PreparedIn* prep;
+    int phase = 0;
+};
+
+void linear_phase(void* vctx, int worker, int num_workers)
+{
+    LinearCtx& c = *static_cast<LinearCtx*>(vctx);
+    const MoeCpuMatrix& mat = *c.mat;
+    const int n = mat.n;
+    const int nc_live = std::min(c.nc, (c.m_total - c.row0 + MAX_M - 1) / MAX_M);
+    switch (c.phase)
+    {
+        case 0:
+        {
+            static const int idx4[MAX_M] = {0, 1, 2, 3};
+            for (int j = worker; j < nc_live; j += num_workers)
+            {
+                const int r0 = c.row0 + j * MAX_M;
+                const int m = std::min(MAX_M, c.m_total - r0);
+                prepare_rows(mat, c.x + static_cast<size_t>(r0) * mat.k, nullptr, mat.k, idx4, m, c.prep[j]);
+            }
+            break;
+        }
+
+        case 1:
+        {
+            assign_gemvs(worker, num_workers, nc_live, n / 16, [&](int j, int t0, int t1)
+            {
+                run_rows(mat, c.prep[j], c.tout + static_cast<size_t>(j) * MAX_SLOTS * n, t0, t1);
+            });
+            break;
+        }
+
+        default:
+        {
+            if (c.m_total == 1)
+            {
+                // Decode: each worker owns complete 128-column blocks, transform and final store
+                // fused (mirrors forward_phase case 4)
+                const int nb = n / 128;
+                const int b0 = nb * worker / num_workers;
+                const int b1 = nb * (worker + 1) / num_workers;
+                for (int j = 0; j < nc_live; ++j)
+                {
+                    const int r0 = c.row0 + j * MAX_M;
+                    const int m = std::min(MAX_M, c.m_total - r0);
+                    float* t = c.tout + static_cast<size_t>(j) * MAX_SLOTS * n;
+                    fold_rows(t, c.prep[j], m, n, b0 * 128, b1 * 128);
+                    for (int r = 0; r < m; ++r)
+                        for (int block = b0 * 128; block < b1 * 128; block += 128)
+                        {
+                            float* v = t + static_cast<size_t>(r) * n + block;
+                            MoeCpuMatrix part = mat;
+                            part.n = 128;
+                            part.svh += block;
+                            if (part.bias) part.bias += block;
+                            transform_out(part, v, 1);
+                            std::memcpy(c.out + static_cast<size_t>(r0 + r) * n + block, v,
+                                        128 * sizeof(float));
+                        }
+                }
+            }
+            else
+            {
+                for (int j = worker; j < nc_live; j += num_workers)
+                {
+                    const int r0 = c.row0 + j * MAX_M;
+                    const int m = std::min(MAX_M, c.m_total - r0);
+                    float* t = c.tout + static_cast<size_t>(j) * MAX_SLOTS * n;
+                    fold_rows(t, c.prep[j], m, n, 0, n);
+                    transform_out(mat, t, m);
+                    for (int r = 0; r < m; ++r)
+                        std::memcpy(c.out + static_cast<size_t>(r0 + r) * n, t + static_cast<size_t>(r) * n,
+                                    static_cast<size_t>(n) * sizeof(float));
+                }
+            }
+            break;
+        }
+    }
+}
+
+int default_linear_threads()
+{
+    if (const char* e = std::getenv("EXL3_CPU_LINEAR_THREADS")) return std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("EXL3_MOE_CPU_THREADS")) return std::max(1, std::atoi(e));
+    static const int t = []{
+        const CoreOrder co = physical_core_order();
+        return co.n_phys > 0 ? co.n_phys
+                             : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
+    }();
+    return t;
+}
+} // namespace
+
+MoeCpuMatrix exl3_cpu_mul1_make_matrix
+(
+    const at::Tensor& trellis,
+    const at::Tensor& suh,
+    const at::Tensor& svh,
+    const at::Tensor* bias
+)
+{
+    return make_matrix(trellis, suh, svh, bias, false);
+}
+
+void exl3_cpu_mul1_matrix_forward(const MoeCpuMatrix& mat, const at::Half* x, int m_total, float* out, int threads)
+{
+    if (m_total <= 0) return;
+    if (threads <= 0) threads = default_linear_threads();
+
+    const int nc_total = (m_total + MAX_M - 1) / MAX_M;
+    // Chunk-workspace cap (~128 MB of GEMV output): bounds the arena on wide projections (lm_head)
+    // while keeping prefill row blocks large enough to amortize the per-phase pool barriers
+    const int nc = std::max(1, static_cast<int>(std::min<size_t>(
+        nc_total, (size_t(128) << 20) / (size_t(MAX_SLOTS) * mat.n * sizeof(float)))));
+
+    LinearArena& ar = LinearArena::get();
+    auto grow = [](auto& v, size_t n_) { if (v.size() < n_) v.resize(n_); };
+    grow(ar.tin, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+    grow(ar.splat, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+    grow(ar.splat_dup, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+    grow(ar.tout, static_cast<size_t>(nc) * MAX_SLOTS * mat.n);
+    grow(ar.prep, nc);
+
+    LinearCtx ctx;
+    ctx.mat = &mat;
+    ctx.x = x;
+    ctx.out = out;
+    ctx.m_total = m_total;
+    ctx.nc = nc;
+    ctx.tout = ar.tout.data();
+    ctx.prep = ar.prep.data();
+    for (int j = 0; j < nc; ++j)
+        ctx.prep[j] = { ar.tin.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k,
+                        ar.splat.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k,
+                        ar.splat_dup.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k, {}, {} };
+
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    g_pool.ensure(threads);
+    for (int row0 = 0; row0 < m_total; row0 += nc * MAX_M)
+    {
+        ctx.row0 = row0;
+        for (int phase = 0; phase < 3; ++phase)
+        {
+            ctx.phase = phase;
+            g_pool.run(&linear_phase, &ctx);
+        }
+    }
+}
+
 #else  // !x86: EXL3_AARCH64_STUB — CPU MoE offload kernels are AVX-only; stubbed on this architecture
 #include "moe_mul1.h"
 #include <torch/extension.h>
@@ -3203,4 +3381,10 @@ int64_t exl3_moe_cpu_make_layer(
 void exl3_moe_cpu_free_layer(int64_t) {}
 void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
 void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }
+MoeCpuMatrix exl3_cpu_mul1_make_matrix(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor*)
+{
+    NO_MOE_CPU();
+    return MoeCpuMatrix{};
+}
+void exl3_cpu_mul1_matrix_forward(const MoeCpuMatrix&, const at::Half*, int, float*, int) { NO_MOE_CPU(); }
 #endif
