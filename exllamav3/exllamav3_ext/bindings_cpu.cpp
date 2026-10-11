@@ -13,6 +13,8 @@
 #include "hadamard.h"
 #include "cpu/moe_mul1.h"
 #include "cpu/hc_mix_cpu.h"
+#include "cpu/gdn_step_cpu.h"
+
 #include "ngram.cuh"
 #include "sam.h"
 
@@ -78,6 +80,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gr_mix_cpu", &gr_mix_cpu, "gr_mix_cpu",
           py::call_guard<py::gil_scoped_release>());
     m.def("gr_mix_cpu_has_avx512", &gr_mix_cpu_has_avx512, "gr_mix_cpu_has_avx512");
+
+    m.def("gdn_step_cpu", &gdn_step_cpu, "gdn_step_cpu",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("gdn_step_cpu_has_avx512", &gdn_step_cpu_has_avx512, "gdn_step_cpu_has_avx512");
 
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
 #ifndef _WIN32
