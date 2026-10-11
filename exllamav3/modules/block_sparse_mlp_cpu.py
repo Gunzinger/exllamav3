@@ -407,6 +407,10 @@ class BlockSparseMLP_CPU:
         self._cpu_shared_sel = None
         self._cpu_shared_w = None
         self.cpu_threads = 0
+        # Packed-trellis upgrade marker: the registrations above hold native-layout bytes
+        # (the deferred loader fills tensors after the module epilogue, so they cannot be
+        # repacked at registration); _cpu_swz_upgrade moves them at first forward
+        self._cpu_swz_checked = False
 
     @staticmethod
     def _cpu_default_threads() -> int:
@@ -451,6 +455,7 @@ class BlockSparseMLP_CPU:
         def tensors(l, attr):
             return [getattr(l.inner, attr).contiguous()]
         g, u, d = sh.gates[0], sh.ups[0], sh.downs[0]
+        swz = int(all(l.inner.cpu_swz for l in proj))
         self.cpu_shared_handle = ext.exl3_moe_cpu_make_layer(
             tensors(g, "trellis"), tensors(g, "suh"), tensors(g, "svh"),
             tensors(u, "trellis"), tensors(u, "suh"), tensors(u, "svh"),
@@ -458,7 +463,7 @@ class BlockSparseMLP_CPU:
             [], [], [],
             {"silu": 0, "gelu": 1}[sh.activation_fn],
             float(sh.act_limit or 0.0),
-            0,
+            swz,
         )
 
     def load_local_cpu(self, **kwargs) -> None:
@@ -488,6 +493,36 @@ class BlockSparseMLP_CPU:
         if self.cpu_layer_handle is not None:
             ext.exl3_moe_cpu_free_layer(self.cpu_layer_handle)
             self.cpu_layer_handle = None
+        self._register_routed()
+
+    def _cpu_swz_upgrade(self):
+        """First-forward upgrade of the registered moe handles to the packed trellis layout:
+        repack each projection's trellis in place (the registrations hold pointers into that
+        storage) and re-register with the packed flag. Only safe after the loader's deferred
+        fills have landed, i.e. from the first forward; dense linears upgrade lazily at their
+        own first call (LinearEXL3.cpu_repack). All-or-nothing per handle."""
+        if self._cpu_swz_checked:
+            return
+        self._cpu_swz_checked = True
+        if os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") == "0":
+            return
+        def upgrade(linears, reregister):
+            if not all(l.inner.cpu_can_swizzle() for l in linears):
+                return
+            for l in linears:
+                l.inner.cpu_repack(inplace = True)
+            reregister()
+        if self.cpu_shared_handle is not None:
+            sh = self.shared_experts
+            upgrade([sh.gates[0], sh.ups[0], sh.downs[0]], self._shared_register)
+        if self.cpu_layer_handle is not None:
+            experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
+            upgrade([l for ls in experts for l in ls], self._register_routed)
+
+    def _register_routed(self):
+        """(Re-)register the routed experts with the in-process moe_mul1 kernel."""
+        act = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn]
+        experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
 
         def tensors(ls, attr):
             return [getattr(l.inner, attr).contiguous() for l in ls]
@@ -495,6 +530,13 @@ class BlockSparseMLP_CPU:
                   if self.gated else [[], [], []])
         up_t = [tensors(self.ups, a) for a in ("trellis", "suh", "svh")]
         down_t = [tensors(self.downs, a) for a in ("trellis", "suh", "svh")]
+        # Packed trellis layout flag: all-or-nothing per layer (one swizzled arg for the whole
+        # registration). At load time the Linears are still native (their packed-layout upgrade
+        # happens at first forward, _cpu_swz_upgrade), so this is 0 here
+        swz_flags = {l.inner.cpu_swz for ls in experts for l in ls}
+        swz = 1 if swz_flags == {True} else 0
+        if len(swz_flags) > 1:
+            print(f" !! {self.key}: mixed packed/native trellis, registering native (slower)")
         # The registered layer holds its own tensor references (moe_mul1.cpp MoeCpuLayer::refs),
         # so the handle stays valid independently of the Linears' inner tensors
         self.cpu_layer_handle = ext.exl3_moe_cpu_make_layer(
@@ -502,7 +544,7 @@ class BlockSparseMLP_CPU:
             [], [], [],
             act,
             float(self.act_limit or 0.0),
-            0,
+            swz,
         )
 
     def cpu_forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None):
@@ -510,6 +552,7 @@ class BlockSparseMLP_CPU:
         kernel (or the per-expert torch path), shared experts and the sigmoid shared gate in
         torch. Mirrors the CUDA forward's contract: fp32 routed sum, out per the module's
         out_dtype (float)."""
+        self._cpu_swz_upgrade()
         y = x.view(-1, self.hidden_size)
         if self.alt_residual_channel:
             y = params["residual"].view(-1, self.hidden_size)
