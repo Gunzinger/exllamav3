@@ -13,6 +13,126 @@ RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
+# Packed ("swizzled") trellis layout for the CPU mul1 kernels, same rule everywhere
+# (exl3_moe_cpu_swizzle_group / exl3_moe_cpu_planar_layout; EXL3_MOE_CPU_SWIZZLE=0 rolls back):
+# tile (kt, nt) moves to (nt/group, kt, nt%group), and with planar each tile's dwords are
+# transposed (dword w to 8*(w%bits) + w/bits)
+_cpu_swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
+
+if _cpu_swizzle and os.name == "posix":
+    # The repack doubles each trellis tensor transiently; the freed native copy must go back to
+    # the OS, not idle in the heap until the next same-size allocation (glibc's dynamic mmap
+    # threshold rides every large free upward and retains GBs over a full-expert load). One
+    # explicit mallopt freezes the threshold at its default: every >= 128 KiB block is mmap'd
+    # and unmapped on free, so peak RSS stays ~one tensor above the resident set
+    import ctypes
+    ctypes.CDLL(None).mallopt(-3, 128 << 10)   # M_MMAP_THRESHOLD
+
+# 2 MiB pages for the CPU-resident trellis (TLB reach on the GEMV streams); best effort
+_cpu_thp = os.name == "posix" and os.environ.get("EXL3_CPU_THP", "1") != "0"
+
+if _cpu_thp:
+    import ctypes as _ct
+
+    _libc = _ct.CDLL(None, use_errno = True)
+    _libc.madvise.argtypes = [_ct.c_void_p, _ct.c_size_t, _ct.c_int]
+
+    def thp_advise(tensor: torch.Tensor, min_bytes: int = 4 << 20) -> None:
+        try:
+            nbytes = tensor.numel() * tensor.element_size()
+            if nbytes < min_bytes:
+                return
+            beg = tensor.data_ptr() & ~_ct.c_size_t(4095)
+            end = (tensor.data_ptr() + nbytes + 4095) & ~_ct.c_size_t(4095)
+            # Mark the range eligible; a THP=madvise host's khugepaged collapses it in the
+            # background. MADV_COLLAPSE (6.1+) would do it now but is rejected on some kernels
+            # for ordinary anonymous mappings (EINVAL), so it is only attempted
+            if _libc.madvise(_ct.c_void_p(beg), _ct.c_size_t(end - beg), 14) != 0:   # MADV_HUGEPAGE
+                return
+            _libc.madvise(_ct.c_void_p(beg), _ct.c_size_t(end - beg), 25)            # MADV_COLLAPSE
+        except Exception:
+            pass
+else:
+    def thp_advise(tensor: torch.Tensor, min_bytes: int = 4 << 20) -> None:
+        pass
+
+
+def _swizzle_trellis_cpu(trellis: torch.Tensor, group: int, planar: bool) -> torch.Tensor:
+    tk, tn, ps = trellis.shape
+    dst = torch.empty_like(trellis)
+    if planar:
+        wd = ps // 2
+        dst.view(torch.int32).view(tn // group, tk, group, wd // 8, 8).copy_(
+            trellis.view(torch.int32).view(tk, tn // group, group, 8, wd // 8).permute(1, 0, 2, 4, 3))
+    else:
+        dst.view(tn // group, tk, group, ps).copy_(
+            trellis.view(tk, tn // group, group, ps).permute(1, 0, 2, 3))
+    return dst
+
+
+def cpu_linear_forward_batch(linears, x, params, out_dtypes = None):
+    """Batched CPU decode forward for same-input EXL3 linears (one projection group per
+    worker-pool round set instead of one call per matrix). Returns the per-linear outputs with
+    each linear's own shape; out_dtypes[i] (or the Linear's own resolution when None) decides
+    fp32/fp16 per output. Falls back to the per-linear forward path whenever any linear would
+    take anything but the plain EXL3 kernel semantics (override, padding, softcap, LoRA,
+    scalers, trimmed outputs, non-CPU tensors)."""
+    ovr = params.get("ovr") if isinstance(params, dict) else None
+    k = x.shape[-1]
+    eligible = x.is_contiguous()
+    if eligible:
+        for i, l in enumerate(linears):
+            inner = getattr(l, "inner", None)
+            if (
+                not isinstance(inner, LinearEXL3) or
+                not getattr(inner, "is_cpu", False) or
+                not inner.mul1 or
+                l.in_features != k or
+                l.softcap or
+                l.lora_a_tensors or
+                l.pre_scale != 1.0 or
+                l.post_scale != 1.0 or
+                (l.out_features != getattr(l, "out_features_unpadded", l.out_features)) or
+                (ovr is not None and l.key in ovr)
+            ):
+                eligible = False
+                break
+    if not eligible:
+        return [
+            l.forward(x, params, out_dtypes[i] if out_dtypes else None)
+            for i, l in enumerate(linears)
+        ]
+
+    dts = []
+    for i, l in enumerate(linears):
+        dt = out_dtypes[i] if out_dtypes else None
+        dts.append(dt or l.out_dtype or l.inner.default_out_dtype)
+    # Packed-layout upgrade at first use (the loader's deferred fills may still be pending at
+    # construction); all-or-nothing per group keeps the C++ swizzled flag uniform
+    if not all(l.inner.cpu_repack() for l in linears):
+        # Some matrix in the group has no packed form (or bytes already registered native in a
+        # moe handle): the repacked and native members would disagree, so fall back per linear
+        return [
+            l.forward(x, params, out_dtypes[i] if out_dtypes else None)
+            for i, l in enumerate(linears)
+        ]
+    ys = ext.exl3_cpu_linear_forward_batch(
+        [l.inner.trellis for l in linears],
+        [l.inner.suh for l in linears],
+        [l.inner.svh for l in linears],
+        [l.inner.K for l in linears],
+        [l.inner.bias for l in linears],
+        x.view(-1, k),
+        [dt == torch.float for dt in dts],
+        [l.inner.cpu_swz for l in linears],
+    )
+    out = []
+    for l, dt, y in zip(linears, dts, ys):
+        if y.dtype != dt:
+            y = y.to(dt)
+        out.append(y.view(x.shape[:-1] + (l.out_features,)))
+    return out
+
 class LinearEXL3:
 
     quant_type: str = "exl3"
@@ -85,6 +205,7 @@ class LinearEXL3:
         # BC (CUDA graph buffer collection) and the g_tensor_cache workspace it borrows are
         # CUDA-only; the CPU forward runs the moe_mul1 kernels directly
         self.is_cpu = self.trellis.device.type == "cpu"
+        self.cpu_swz = False
         if self.is_cpu:
             self.bc = None
         else:
@@ -104,6 +225,36 @@ class LinearEXL3:
     def unload(self):
         # g_tensor_cache.drop(*self.bsz1_xh_args)
         pass
+
+
+    def cpu_can_swizzle(self) -> bool:
+        """This linear's trellis has a packed-layout form the CPU kernels can take."""
+        return (
+            self.is_cpu and self.mul1 and _cpu_swizzle and
+            bool(ext.exl3_moe_cpu_swizzle_group(float(self.K)))
+        )
+
+
+    def cpu_repack(self, inplace: bool = False) -> bool:
+        """One-time move of the trellis bytes into the packed layout the banded CPU kernels
+        stream sequentially (cpu_swz records that the bytes moved; make_matrix re-derives the
+        flag from the rate either way). Must not run before the loader's deferred fills have
+        landed — construction-time bytes are unfilled staging — so callers do this at first
+        use. inplace: permute within the existing storage, keeping data_ptr (a registered
+        moe_mul1 layer holds raw pointers into this tensor)."""
+        if self.cpu_swz or not self.cpu_can_swizzle():
+            return self.cpu_swz
+        Kf = float(self.K)
+        grp = ext.exl3_moe_cpu_swizzle_group(Kf)
+        pln = bool(ext.exl3_moe_cpu_planar_layout(Kf))
+        swz = _swizzle_trellis_cpu(self.trellis, grp, pln)
+        if inplace:
+            self.trellis.copy_(swz)
+        else:
+            self.trellis = swz
+        self.cpu_swz = True
+        thp_advise(self.trellis)
+        return True
 
 
     def get_tensors(self, key: str):
@@ -145,10 +296,11 @@ class LinearEXL3:
                 raise NotImplementedError(f"LinearEXL3 {self.key}: reconstruct is not supported on CPU")
             assert self.mul1, \
                 f"LinearEXL3 {self.key}: CPU forward supports the mul1 codebook only (mcg is unsupported)"
+            self.cpu_repack()
             dtype = out_dtype or self.default_out_dtype
             y = ext.exl3_cpu_linear_forward(
                 self.trellis, self.suh, self.svh, self.K, self.bias,
-                x.view(-1, self.in_features), dtype == torch.float
+                x.view(-1, self.in_features), dtype == torch.float, self.cpu_swz
             )
             return y.view(x.shape[:-1] + (self.out_features,))
 

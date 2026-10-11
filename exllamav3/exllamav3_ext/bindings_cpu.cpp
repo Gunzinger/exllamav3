@@ -57,6 +57,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // the CUDA-stream handoff, which the CPU-only path bypasses. set_memops only configures that
     // handoff's wait primitive, and moe_cpu_host.py calls it at import, so it exists as a no-op
     m.def("exl3_moe_cpu_set_memops", [](bool) {}, "exl3_moe_cpu_set_memops");
+    m.def("exl3_moe_cpu_swizzle_group", &exl3_moe_cpu_swizzle_group, "exl3_moe_cpu_swizzle_group");
+    m.def("exl3_moe_cpu_planar_layout", &exl3_moe_cpu_planar_layout, "exl3_moe_cpu_planar_layout");
 
     // GPU-only kernels whose function objects Python binds at import time (modules/
     // moe_batch_recon.py builds its activation dispatch from them): registered as stubs with the
@@ -84,6 +86,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
     #include "cpu/linear_mul1.h"
     m.def("exl3_cpu_linear_forward", &exl3_cpu_linear_forward, "exl3_cpu_linear_forward",
+          py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("bias"),
+          py::arg("x"), py::arg("want_fp32_out"), py::arg("swizzled") = false,
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_cpu_linear_forward_batch", &exl3_cpu_linear_forward_batch,
+          "exl3_cpu_linear_forward_batch",
+          py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("bias"),
+          py::arg("x"), py::arg("want_fp32_out"), py::arg("swizzled"),
           py::call_guard<py::gil_scoped_release>());
 
     #include "sam_bc.h"

@@ -12,6 +12,7 @@ from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
+from .quant.exl3 import cpu_linear_forward_batch
 import os
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
@@ -1418,8 +1419,10 @@ class GatedDeltaNet(Module):
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
-                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
-                z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
+                # One worker-pool round set for both same-input projections on the CPU kernels
+                qkv, z = cpu_linear_forward_batch(
+                    [self.qkv_proj, self.z_proj], x, params, [_proj_dtype, None]
+                )
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
