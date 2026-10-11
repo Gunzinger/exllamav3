@@ -63,6 +63,7 @@ CPU_SOURCES = [
     "cpu_compat/cuda_stub.cpp",
     "cpu/moe_mul1.cpp",
     "cpu/linear_mul1.cpp",
+    "cpu/hc_mix_cpu.cpp",
     "cpu/ngram_cpu.cpp",
     "avx2_target.cpp",
     "avx512_target.cpp",

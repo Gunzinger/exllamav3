@@ -21,6 +21,15 @@ _gr_mix_tiled_enable = os.environ.get("EXL3_GR_MIX_TILED", "1") != "0"
 _hc_fold = HC_FOLD
 _HC_FOLD_MAX_R = 32
 
+# Fused AVX-512 CPU mix (cpu/hc_mix_cpu.cpp): probed once at import. The stub environment of the
+# A4 fallback tests (and a CUDA-only ext, which does not bind the CPU kernels) raises on the
+# attribute and every CPU mix lands on the torch reference path instead
+_gr_mix_cpu = False
+try:
+    _gr_mix_cpu = bool(ext.gr_mix_cpu_has_avx512())
+except Exception:
+    _gr_mix_cpu = False
+
 
 def hc_flush(params: dict):
     """Run a deferred HyperConnection.apply_ (held in params["hc_pending"]) before anything other than the
@@ -548,6 +557,18 @@ class GatedResidual(Module):
             s3 = s3.contiguous()
         dev = s3.device
         if dev.type == "cpu":
+            # Fused AVX-512 kernel (cpu/hc_mix_cpu.cpp), same fused domain as the CUDA decode
+            # pair; anything else (no ISA, big R, unexpected layout) stays on the reference
+            if (_gr_mix_cpu and H == 4 and Dh % 16 == 0 and self.rank % 16 == 0
+                    and R <= self.FUSED_MAX_R and self.up_h is not None and self.norm_w is not None
+                    and self.proj_h[: self.proj_m].is_contiguous() and self.norm_w.is_contiguous()
+                    and s3.is_contiguous()):
+                post = torch.empty((R, H), dtype = torch.float, device = dev) \
+                    if self.use_combine else None
+                mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
+                ext.gr_mix_cpu(s3, self.proj_h[: self.proj_m], self.up_h, self.norm_w,
+                               self.rms_eps, post, mixed)
+                return post, mixed
             post, mixed = self._mix_ref(s3)
             return post, mixed.half()
         xw = self._weighted_copy(s3, params)
