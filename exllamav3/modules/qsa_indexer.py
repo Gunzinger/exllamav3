@@ -38,6 +38,14 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     return torch.cat((x_rope * cos + rot * sin, x_pass), dim = -1)
 
 
+def _gather_ws(numel: int, device, tag: str, dtype: torch.dtype = torch.float) -> torch.Tensor:
+    """Bucketed static buffer for the gathered K/V pages (decode-hot: re-gathering up to the
+    token budget per layer per step reallocates multi-MB buffers and re-faults their pages
+    every call)."""
+    from ..util.tensor import g_tensor_cache
+    return g_tensor_cache.get_bucketed(device, numel, dtype, tag)
+
+
 def _attend_rows_gather(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -65,8 +73,16 @@ def _attend_rows_gather(
         idx = idx[idx >= 0].long()
         if bt is not None:
             idx = bt[r // seq, idx // page_size] * page_size + idx % page_size
-        kk = k[idx].float()
-        vv = v[idx].float()
+        L = idx.shape[0]
+        n = L * kvh * hd
+        kh = _gather_ws(n, k.device, "qsa_gather_k", k.dtype)[:n].view(L, kvh, hd)
+        vh = _gather_ws(n, v.device, "qsa_gather_v", v.dtype)[:n].view(L, kvh, hd)
+        torch.index_select(k, 0, idx, out = kh)
+        torch.index_select(v, 0, idx, out = vh)
+        kk = _gather_ws(n, k.device, "qsa_gather_kf")[:n].view(L, kvh, hd)
+        vv = _gather_ws(n, v.device, "qsa_gather_vf")[:n].view(L, kvh, hd)
+        kk.copy_(kh)
+        vv.copy_(vh)
         # scores per kv head over its q-head group: no (n, H, hd) expansion (the gather is
         # decode-hot; expanding 24 heads x 256 dims x ~2k rows costs ~25 MB per direction)
         s = torch.einsum("kgd,nkd->kgn", q[r].view(kvh, group, hd).float(), kk) * sm_scale
