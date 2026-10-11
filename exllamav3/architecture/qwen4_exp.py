@@ -46,8 +46,10 @@ class Qwen4ExpConfig(Qwen3_5VLMoeBaseConfig):
         from .qwen3_vl import Qwen3VLVisionModel
         # Identical tower to Qwen3.5 (HF: Qwen4ExpVisionModel subclasses Qwen3_5MoeVisionModel
         # with no changes; no deepstack). Text-only checkpoints (converted dirs without a
-        # transplanted tower) are detected by the missing preprocessor config
-        has_vision = os.path.exists(os.path.join(directory, "preprocessor_config.json"))
+        # transplanted tower) are detected by the missing preprocessor config. CPU-only trial:
+        # skip the vision tower entirely (its modules are CUDA-bound)
+        has_vision = os.path.exists(os.path.join(directory, "preprocessor_config.json")) \
+            and os.environ.get("EXL3_CPU_TEXT_ONLY", "0") == "0"
         super().__init__(
             directory,
             "text_config",

@@ -324,7 +324,7 @@ class Job:
                 (1, self.generator.padded_vocab_size),
                 dtype = torch.half,
                 device = "cpu",
-                pin_memory = True
+                pin_memory = torch.cuda.is_available()
             )
         return self.pinned_logit_mask
 
@@ -336,7 +336,7 @@ class Job:
                 (1, self.generator.padded_vocab_size // 32),
                 dtype = torch.int32,
                 device = "cpu",
-                pin_memory = True
+                pin_memory = torch.cuda.is_available()
             )
         return self.pinned_logit_bitmask
 
@@ -1703,7 +1703,7 @@ class Job:
         n = len(self.sequences[0].sequence_ids)
         if self.pinned_ids is None:
             max_ids = max(len(seq.sequence_ids) for seq in self.sequences) + self.max_new_tokens + 8
-            self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
+            self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = torch.cuda.is_available())
             self.pinned_ids_valid = 0
         # The sequence only grows by appending or shrinks by truncation (which clamps the
         # watermark), so the buffer is valid below the watermark and only the tail is staged

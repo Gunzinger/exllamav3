@@ -381,7 +381,7 @@ class PLELayer(Module):
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
         if self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
-                and streams.dtype == torch.float and streams.is_contiguous() \
+                and streams.dtype == torch.float and streams.is_contiguous() and streams.is_cuda \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
             emb = emb.contiguous()
             # Row slabs: the ext call keeps six or so full-width fp32/fp16 working tensors of
@@ -426,8 +426,15 @@ class PLELayer(Module):
         # per-stream key/query dots as a batched (1, D) x (D, 1) matmul, then the fused gate
         # kernel: gated = sigmoid(signed_sqrt(dot * scale)) * value broadcast over streams
         gate = torch.bmm(query.view(-1, 1, D), key.reshape(-1, D, 1)).view(bsz, seq, H)
-        gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
-        ext.ple_gate(gate, value, gated, self.gate_scale)
+        if gate.is_cuda:
+            gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
+            ext.ple_gate(gate, value, gated, self.gate_scale)
+        else:
+            g = gate * self.gate_scale
+            a = g.abs().clamp_min(1e-6).sqrt()
+            ss = torch.where(g > 0, a, torch.where(g < 0, -a, torch.zeros_like(a)))
+            s = torch.sigmoid(ss).unsqueeze(-1)
+            gated = (s * value.float().unsqueeze(2)).contiguous()
         normed = self.norm_conv.forward(gated, params, out_dtype = torch.half).flatten(-2)
         conv_out, conv_stream = self._short_conv(normed, conv_state)
         delta = gated + conv_out.view(bsz, seq, H, D)
