@@ -403,6 +403,9 @@ class BlockSparseMLP_CPU:
         # experts run in-process through the moe_mul1 kernel (no worker, no CUDA handoff)
         self.cpu_layer = False
         self.cpu_layer_handle = None
+        self.cpu_shared_handle = None
+        self._cpu_shared_sel = None
+        self._cpu_shared_w = None
         self.cpu_threads = 0
 
     @staticmethod
@@ -417,6 +420,47 @@ class BlockSparseMLP_CPU:
             default_worker_threads(n_phys, host_cores) if n_phys and host_cores > 0
             else max(1, (os.cpu_count() or 2) // 2)))
 
+    def _shared_register(self) -> None:
+        """Register the shared expert with the in-process moe_mul1 kernel as a one-expert
+        layer (the same fused gate/up/act/down call the routed experts take, weights fixed
+        to 1) when it is eligible: single-slice GatedMLP, silu/gelu, mul1 codebook, no bias,
+        dims the kernel accepts. Leaves cpu_shared_handle = None otherwise and cpu_forward
+        keeps the GatedMLP torch path."""
+        sh = self.shared_experts
+        if sh is None or sh.num_slices != 1:
+            return
+        if sh.interm_div != 1.0 or sh.activation_fn not in ("silu", "gelu"):
+            return
+        proj = [sh.gates[0], sh.ups[0], sh.downs[0]]
+        if not all(l.quant_type == "exl3" and l.inner.mul1 and l.inner.bias is None for l in proj):
+            return
+        def ok(l):
+            t = l.inner.trellis
+            return (
+                t.device.type == "cpu" and t.is_contiguous() and
+                t.size(0) * 16 % 128 == 0 and t.size(1) * 16 % 128 == 0 and
+                trellis_rate(t.size(2)) is not None
+            )
+        if not all(ok(l) for l in proj):
+            print(f" !! {self.key}: shared expert not eligible for the CPU MoE kernel, using the torch path")
+            return
+        if self.cpu_shared_handle is not None:
+            ext.exl3_moe_cpu_free_layer(self.cpu_shared_handle)
+            self.cpu_shared_handle = None
+        # The registered layer holds its own tensor references (moe_mul1.cpp MoeCpuLayer::refs)
+        def tensors(l, attr):
+            return [getattr(l.inner, attr).contiguous()]
+        g, u, d = sh.gates[0], sh.ups[0], sh.downs[0]
+        self.cpu_shared_handle = ext.exl3_moe_cpu_make_layer(
+            tensors(g, "trellis"), tensors(g, "suh"), tensors(g, "svh"),
+            tensors(u, "trellis"), tensors(u, "suh"), tensors(u, "svh"),
+            tensors(d, "trellis"), tensors(d, "suh"), tensors(d, "svh"),
+            [], [], [],
+            {"silu": 0, "gelu": 1}[sh.activation_fn],
+            float(sh.act_limit or 0.0),
+            0,
+        )
+
     def load_local_cpu(self, **kwargs) -> None:
         """CPU-device load epilogue (BlockSparseMLP.load with device.type == "cpu"): the
         per-expert Linears have already loaded their tensors onto the CPU through the normal
@@ -426,6 +470,7 @@ class BlockSparseMLP_CPU:
         falls back to the per-expert torch path."""
         self.cpu_layer = True
         self.cpu_threads = self._cpu_default_threads()
+        self._shared_register()
         act = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn]
         experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
         # is_quantized is load_local() state, which the CUDA epilogue computes; derive it here
@@ -515,7 +560,20 @@ class BlockSparseMLP_CPU:
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
 
         if self.shared_experts is not None:
-            sh = self.shared_experts.forward(x, params)
+            if self.cpu_shared_handle is not None:
+                sh_in = x.reshape(-1, self.hidden_size)
+                if not sh_in.is_contiguous():
+                    sh_in = sh_in.contiguous()
+                # Constant selection (expert 0, weight 1): cached per row count, rebuilt when
+                # the batch size changes between decode and prefill chunks
+                sel = self._cpu_shared_sel
+                if sel is None or sel.shape[0] != bsz:
+                    self._cpu_shared_sel = sel = torch.zeros((bsz, 1), dtype = torch.long)
+                    self._cpu_shared_w = torch.ones((bsz, 1), dtype = torch.half)
+                sh = torch.empty((bsz, self.hidden_size), dtype = torch.float)
+                ext.exl3_moe_cpu_forward(self.cpu_shared_handle, sh_in, sel, self._cpu_shared_w, sh, self.cpu_threads)
+            else:
+                sh = self.shared_experts.forward(x, params)
             if self.shared_experts_post_norm is not None:
                 sh = self.shared_experts_post_norm.forward(sh, params)
             if self.shared_gate is not None:
@@ -654,6 +712,9 @@ class BlockSparseMLP_CPU:
         if self.cpu_layer_handle is not None:
             ext.exl3_moe_cpu_free_layer(self.cpu_layer_handle)
             self.cpu_layer_handle = None
+        if self.cpu_shared_handle is not None:
+            ext.exl3_moe_cpu_free_layer(self.cpu_shared_handle)
+            self.cpu_shared_handle = None
         self.cpu_layer = False
         if self.cpu_split_first is not None:
             host = getattr(self, "cpu_host", None)
