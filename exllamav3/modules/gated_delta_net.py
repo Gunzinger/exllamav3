@@ -73,8 +73,8 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
     for l in layers:
         if isinstance(l, GDNLayerState):
             if torch.device(l.device).type != "cuda":
-                # No batched rewind kernels off CUDA; the plain torch rewind is the same math
-                l.rewind(slot, last_history, num_tokens)
+                # No batched rewind kernels off CUDA; the torch rewind is the same math
+                l.rewind(slot, last_history, num_tokens, spec_row, spec_shape, base_row, scratch_row)
                 continue
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
@@ -403,6 +403,52 @@ class GDNLayerState:
         m = self.module
         kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
         return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim
+
+
+    def rewind(self, slot: int, last_history: int, num_tokens: int,
+               spec_row: int | None = None, spec_shape: tuple | None = None,
+               base_row: int = 0, scratch_row: int = 1):
+        """Non-CUDA twin of the batched rewind kernels (ext.batched_conv_rewind +
+        batched_scan_replay): the conv ring copies its recorded window back, and the accepted
+        prefix's state is rebuilt by replaying the staged scan inputs from the base row into
+        the scratch row through the CPU delta-rule scan"""
+        if last_history == 0:
+            return
+        assert 0 <= num_tokens <= last_history, \
+            f"GDN rewind: {num_tokens} tokens outside the recorded history of {last_history}"
+        if num_tokens > 0:
+            cs = self.conv_state
+            cdim = self.module.conv_kernel_size
+            p = cs.shape[-1] - num_tokens
+            cs[slot, :, :cdim].copy_(cs[slot, :, p - cdim : p])
+        if last_history > 0 and num_tokens > 0:
+            assert spec_shape is not None and spec_row is not None, \
+                "GDN rewind: history was recorded but the pass staged no scan inputs to replay"
+            prefix = last_history + 1 - num_tokens
+            bsz, seqlen, stride = spec_shape
+            rows = ([slot * seqlen + t for t in range(prefix)] if stride == 1
+                    else [t * bsz + slot for t in range(prefix)])
+            m = self.module
+            self.recurrent_state[scratch_row, 0].copy_(self.recurrent_state[base_row, 0])
+            g = self.spec_g[rows]
+            if getattr(m, "kda", False):
+                g = g.reshape(prefix, m.num_v_heads, m.k_head_dim)
+            from .gated_delta_net_fn import gated_delta_rule_fn
+            gated_delta_rule_fn(
+                mixed_qkv = self.spec_conv[rows].view(1, prefix, -1),
+                beta = self.spec_beta[rows].view(1, prefix, -1),
+                g = g.view(1, prefix, -1),
+                recurrent_state = self.recurrent_state,
+                recurrent_slots = torch.tensor([scratch_row], dtype = torch.long),
+                history = False,
+                save_state = True,
+                num_k_heads = m.num_k_heads,
+                num_v_heads = m.num_v_heads,
+                k_dim = m.k_dim,
+                v_dim = m.v_dim,
+                k_head_dim = m.k_head_dim,
+                v_head_dim = m.v_head_dim,
+            )
 
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
