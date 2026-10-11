@@ -118,6 +118,8 @@ def _torch_paged_gather_sdpa(
     softmax_scale,
     causal = True,
     chunk_size = 512,
+    window_size = None,
+    softcap = None,
 ):
     batch, seqlen_q, nheads, headdim = q.shape
     _, seqlen_new, nheads_k, _ = k.shape

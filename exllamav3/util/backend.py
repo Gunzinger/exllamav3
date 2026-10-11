@@ -88,7 +88,10 @@ def compute_capability(device) -> tuple[int, int]:
     """(major, minor) of a CUDA device; (0, 0) on ROCm, where the HIP major is a gfx generation"""
     if ROCM:
         return (0, 0)
-    idx = device.index if isinstance(device, torch.device) else device
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if dev.type != "cuda":
+        return (0, 0)
+    idx = dev.index
     if idx is None:
         idx = torch.cuda.current_device()
     cc = _cc_cache.get(idx)
