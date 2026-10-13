@@ -25,11 +25,16 @@ def torch_recurrent_gated_delta_rule_cpu(
     v_dim: int,
     k_head_dim: int,
     v_head_dim: int,
+    slots_in: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Sequential grouped delta rule on CPU tensors, mirroring ext.cuda_recurrent_gated_delta_rule
     (gdn.cu: cuda_recurrent_gated_delta_rule_kernel: in-kernel q/k l2norm, per-v-head beta/g
     over the shared k-head's state, intermediate states into the history slots, output bf16)
+
+    slots_in: base rows a speculative pass (history) reads its initial state from, writing the
+    final state to the scratch rows in recurrent_slots; no intermediate states are stored (the
+    rewind replays the staged scan inputs), matching the CUDA kernel's slots_in semantics
     """
     bsz, seqlen, _ = mixed_qkv.shape
     group = num_v_heads // num_k_heads
@@ -47,7 +52,8 @@ def torch_recurrent_gated_delta_rule_cpu(
         idx = None
     else:
         idx = recurrent_slots.long() if recurrent_slots is not None else None
-        state = (recurrent_state[idx, 0] if idx is not None else recurrent_state[:bsz, 0]).clone()
+        in_idx = slots_in.long() if slots_in is not None else idx
+        state = (recurrent_state[in_idx, 0] if in_idx is not None else recurrent_state[:bsz, 0]).clone()
 
     # The step math is expressed as batched GEMMs over (bsz * nv, dk, dv): the broadcast
     # elementwise form moves the fp32 state through ~5 full-size temporaries per token
@@ -60,7 +66,7 @@ def torch_recurrent_gated_delta_rule_cpu(
         state3.mul_(decay[:, t].reshape(-1, 1, 1))
         state3.baddbmm_(kt.reshape(-1, k_head_dim, 1), u.reshape(-1, 1, v_head_dim))
         out[:, t] = (torch.matmul(q[:, t].unsqueeze(-2), state).squeeze(-2) * scale).to(torch.bfloat16)
-        if history and t < seqlen - 1 and recurrent_state is not None:
+        if history and slots_in is None and t < seqlen - 1 and recurrent_state is not None:
             if idx is not None:
                 recurrent_state[idx, t + 1] = state
             else:
@@ -297,6 +303,7 @@ def gated_delta_rule_fn(
         return torch_recurrent_gated_delta_rule_cpu(
             mixed_qkv, beta, g, recurrent_state, recurrent_slots, history, save_state,
             num_k_heads, num_v_heads, k_dim, v_dim, k_head_dim, v_head_dim,
+            slots_in,
         )
 
     # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
