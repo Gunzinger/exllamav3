@@ -66,6 +66,7 @@ CPU_SOURCES = [
     "cpu/hc_mix_cpu.cpp",
     "cpu/gdn_step_cpu.cpp",
     "cpu/ngram_cpu.cpp",
+    "cpu/fused_sampler_cpu.cpp",
     "avx2_target.cpp",
     "avx512_target.cpp",
     "hadamard.cpp",

@@ -18,8 +18,11 @@
 // CUDA kernel instead applies the half weight. All accumulation is fp32; fn/up are fp16 and
 // converted in the inner loops. Two phases per call (dots, finalize) over a private floating
 // spin-parked pool (no core pinning: the bursts must not preempt the moe pool's pinned workers,
-// see the Pool note in the source) with one in-function barrier; threads =
-// EXL3_HC_MIX_CPU_THREADS, else a quarter of the logical CPU count (the bursts stop scaling
+// see the Pool note in the source) with one in-function barrier; workers are spawned with the
+// process's load-time affinity mask (they would otherwise inherit the moe/linear pool's pinned
+// caller and share its one core with the master), and joins that stay over 4 ms cap the pool at
+// one worker (EXL3_HC_MIX_CPU_ADAPT=0 disables). Threads = EXL3_HC_MIX_CPU_THREADS, else a
+// quarter of the logical CPU count (the bursts stop scaling
 // well past ~6 workers). Requires AVX-512F/BW/VL + FMA + F16C (gr_mix_cpu_has_avx512); callers
 // fall back to _mix_ref when it reports false or the tensors are ineligible.
 //   streams: (R, H, D) float, CPU, contiguous, H = 4, R in [1, 8]
