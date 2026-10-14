@@ -26,8 +26,10 @@
 // well past ~6 workers). Requires AVX-512F/BW/VL + FMA + F16C (gr_mix_cpu_has_avx512); callers
 // fall back to _mix_ref when it reports false or the tensors are ineligible.
 //   streams: (R, H, D) float, CPU, contiguous, H = 4, R in [1, 8]
-//   fn:      (M, H * D) half, M = LR + (post ? H : 0)   (proj_h[:proj_m])
-//   up:      (H * D, LR) half, checkpoint orientation (not the CUDA kernel's repacked upt)
+//   fn:      (M, H * D) half, or bfloat16 (dispatch on dtype: same math, fp32 accumulation;
+//            bf16 tables halve the per-call table stream, python-side EXL3_HC_BF16 repack),
+//            M = LR + (post ? H : 0)
+//   up:      (H * D, LR) same dtype as fn, checkpoint orientation (not the CUDA kernel's repacked upt)
 //   w:       (H * D) float norm weight (incl +1)
 //   post:    (R, H) float out, or none (final-mixer form)
 //   mixed:   (R, D) half out

@@ -30,6 +30,11 @@ try:
 except Exception:
     _gr_mix_cpu = False
 
+# C1: bf16 CPU hc tables (gr_mix_cpu dispatches on the table dtype): halves the ~13 MB/call
+# table stream. Tables are cast lazily at the first CPU mix -- never at load, the deferred
+# loader must not see extra byte copies -- and cached per module. Default off until A/B
+_hc_bf16_tables = os.environ.get("EXL3_HC_BF16", "0") == "1"
+
 
 def hc_flush(params: dict):
     """Run a deferred HyperConnection.apply_ (held in params["hc_pending"]) before anything other than the
@@ -381,6 +386,8 @@ class GatedResidual(Module):
         self.proj_h = None          # cat(down, inject) half, zero-padded to a multiple of 64
                                     # rows for the tiled path (other paths use [:proj_m])
         self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
+        self.proj_bf16 = None       # (proj_m, H * D) bf16, lazy CPU-side cache (EXL3_HC_BF16)
+        self.up_bf16 = None         # (H * D, rank) bf16, same
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel
         self.next_site = None       # GatedResidual whose mix follows this site's apply_ (link_sites)
@@ -405,6 +412,7 @@ class GatedResidual(Module):
         # Derived buffers are deduplicated: down/inject live as views of proj_h, up is kept in
         # its checkpoint orientation (the GEMM path transposes by view) only while the sources
         # are wanted, and the fused decode kernel reads the repacked copy
+        self.proj_bf16 = self.up_bf16 = None
         dev = down.device
         H, Dh = self.hc_mult, self.hidden_size
         self.norm_w = (self.norm_w_raw.float() + 1.0).view(H, Dh).contiguous()
@@ -446,6 +454,7 @@ class GatedResidual(Module):
         super().unload()
         self.norm_w_raw = self.norm_w = self.w_h = None
         self.down_h = self.up_h = self.upx_h = self.inject_h = self.proj_h = None
+        self.proj_bf16 = self.up_bf16 = None
 
     @override
     def get_tensors(self):
@@ -566,8 +575,16 @@ class GatedResidual(Module):
                 post = torch.empty((R, H), dtype = torch.float, device = dev) \
                     if self.use_combine else None
                 mixed = torch.empty((R, Dh), dtype = torch.half, device = dev)
-                ext.gr_mix_cpu(s3, self.proj_h[: self.proj_m], self.up_h, self.norm_w,
-                               self.rms_eps, post, mixed)
+                if _hc_bf16_tables:
+                    # Lazy bf16 table cache: built at the first mix, never at load
+                    if self.proj_bf16 is None:
+                        self.proj_bf16 = self.proj_h[: self.proj_m].bfloat16().contiguous()
+                    if self.up_bf16 is None:
+                        self.up_bf16 = self.up_h.bfloat16().contiguous()
+                    fn_t, up_t = self.proj_bf16, self.up_bf16
+                else:
+                    fn_t, up_t = self.proj_h[: self.proj_m], self.up_h
+                ext.gr_mix_cpu(s3, fn_t, up_t, self.norm_w, self.rms_eps, post, mixed)
                 return post, mixed
             post, mixed = self._mix_ref(s3)
             return post, mixed.half()

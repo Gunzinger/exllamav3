@@ -229,7 +229,18 @@ inline float gr_sigmoid(float x)
     return 1.0f / (1.0f + std::exp(-x));
 }
 
+// 16-lane fp16/bf16 -> fp32 convert; bf16 is the high half of an fp32 (plain 16-bit shift),
+// exact, no avx512bf16 needed. Same latency class as vcvtph2ps on Zen 5
+template <bool BF16>
+HC_TARGET_AVX512
+inline __m512 gr_cvt16_ps(const __m256i v)
+{
+    if (BF16) return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(v), 16));
+    return _mm512_cvtph_ps(v);
+}
+
 // dots[j, h] = <streams * w, fn[j, h]> over one stream row
+template <bool BF16>
 HC_TARGET_AVX512
 inline float gr_dot_w(const float* s, const float* w, const uint16_t* f, int D)
 {
@@ -238,7 +249,7 @@ inline float gr_dot_w(const float* s, const float* w, const uint16_t* f, int D)
     {
         __m512 sv = _mm512_loadu_ps(s + d);
         __m512 wv = _mm512_loadu_ps(w + d);
-        __m512 fv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) (f + d)));
+        __m512 fv = gr_cvt16_ps<BF16>(_mm256_loadu_si256((const __m256i*) (f + d)));
         acc = _mm512_fmadd_ps(_mm512_mul_ps(sv, wv), fv, acc);
     }
     return _mm512_reduce_add_ps(acc);
@@ -254,16 +265,18 @@ inline float gr_sumsq(const float* s, int D)
 }
 
 // <t, up row> over one low rank
+template <bool BF16>
 HC_TARGET_AVX512
 inline float gr_dot_t(const float* t, const uint16_t* u, int LR)
 {
     __m512 acc = _mm512_setzero_ps();
     for (int i = 0; i < LR; i += 16)
         acc = _mm512_fmadd_ps(_mm512_loadu_ps(t + i),
-                              _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) (u + i))), acc);
+                              gr_cvt16_ps<BF16>(_mm256_loadu_si256((const __m256i*) (u + i))), acc);
     return _mm512_reduce_add_ps(acc);
 }
 
+template <bool BF16>
 static void gr_dots_range(const GrCtx& c, int i0, int i1)
 {
     const int mh = c.M + 1;
@@ -276,9 +289,9 @@ static void gr_dots_range(const GrCtx& c, int i0, int i1)
         {
             const uint16_t* frow = c.fn + (size_t) j * (c.H * c.D);
             for (int h = 0; h < c.H; ++h)
-                out[h] = gr_dot_w(c.streams + ((size_t) r * c.H + h) * c.D,
-                                  c.w + (size_t) h * c.D,
-                                  frow + (size_t) h * c.D, c.D);
+                out[h] = gr_dot_w<BF16>(c.streams + ((size_t) r * c.H + h) * c.D,
+                                        c.w + (size_t) h * c.D,
+                                        frow + (size_t) h * c.D, c.D);
         }
         else
         {
@@ -288,6 +301,7 @@ static void gr_dots_range(const GrCtx& c, int i0, int i1)
     }
 }
 
+template <bool BF16>
 static void gr_finalize_range(const GrCtx& c, int worker, int d0, int d1, float inv_h)
 {
     const int H = c.H, D = c.D, LR = c.LR, R = c.R;
@@ -329,7 +343,7 @@ static void gr_finalize_range(const GrCtx& c, int worker, int d0, int d1, float 
             const float wd = c.w[(size_t) h * D + d];
             for (int r = 0; r < R; ++r)
             {
-                const float g = gr_dot_t(c.t + (size_t) r * LR, u, LR);
+                const float g = gr_dot_t<BF16>(c.t + (size_t) r * LR, u, LR);
                 o[r] += gr_sigmoid(g) * rmr[r * H + h] * inv_h * wd
                         * c.streams[((size_t) r * H + h) * D + d];
             }
@@ -339,20 +353,21 @@ static void gr_finalize_range(const GrCtx& c, int worker, int d0, int d1, float 
     }
 }
 
+template <bool BF16>
 static void gr_pool_fn(void* vctx, int worker, int nw)
 {
     GrCtx& c = *static_cast<GrCtx*>(vctx);
     const int total_a = c.R * (c.M + 1);
-    gr_dots_range(c, (int) ((int64_t) total_a * worker / nw),
+    gr_dots_range<BF16>(c, (int) ((int64_t) total_a * worker / nw),
                      (int) ((int64_t) total_a * (worker + 1) / nw));
     c.bar.fetch_add(1, std::memory_order_acq_rel);
     while (c.bar.load(std::memory_order_acquire) < nw)
         cpu_pause();
     const int D = c.D;
-    gr_finalize_range(c, worker,
-                      (int) ((int64_t) D * worker / nw),
-                      (int) ((int64_t) D * (worker + 1) / nw),
-                      1.0f / (float) c.H);
+    gr_finalize_range<BF16>(c, worker,
+                            (int) ((int64_t) D * worker / nw),
+                            (int) ((int64_t) D * (worker + 1) / nw),
+                            1.0f / (float) c.H);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -384,10 +399,12 @@ void gr_mix_cpu
                 "gr_mix_cpu: tensors must be on CPU");
     TORCH_CHECK(streams.scalar_type() == at::kFloat && streams.is_contiguous() && streams.dim() == 3,
                 "streams must be contiguous CPU float (R, H, D)");
-    TORCH_CHECK(fn.scalar_type() == at::kHalf && fn.is_contiguous() && fn.dim() == 2,
-                "fn must be contiguous CPU half (M, H * D)");
-    TORCH_CHECK(up.scalar_type() == at::kHalf && up.is_contiguous() && up.dim() == 2,
-                "up must be contiguous CPU half (H * D, LR)");
+    // fn/up: fp16 (default) or both bf16 (EXL3_HC_BF16) -- dispatch below
+    const bool bf16 = fn.scalar_type() == at::kBFloat16;
+    TORCH_CHECK((fn.scalar_type() == at::kHalf || bf16) && fn.is_contiguous() && fn.dim() == 2,
+                "fn must be contiguous CPU half or bfloat16 (M, H * D)");
+    TORCH_CHECK(up.scalar_type() == fn.scalar_type() && up.is_contiguous() && up.dim() == 2,
+                "up must be contiguous CPU, same dtype as fn (H * D, LR)");
     TORCH_CHECK(w.scalar_type() == at::kFloat && w.is_contiguous() && w.numel() == streams.size(1) * streams.size(2),
                 "w must be contiguous CPU float (H * D)");
     const int R = streams.size(0);
@@ -415,8 +432,8 @@ void gr_mix_cpu
     std::vector<float> t((size_t) R * LR);
     GrCtx c;
     c.streams = streams.data_ptr<float>();
-    c.fn = reinterpret_cast<const uint16_t*>(fn.data_ptr<at::Half>());
-    c.up = reinterpret_cast<const uint16_t*>(up.data_ptr<at::Half>());
+    c.fn = reinterpret_cast<const uint16_t*>(fn.const_data_ptr());
+    c.up = reinterpret_cast<const uint16_t*>(up.const_data_ptr());
     c.w = w.data_ptr<float>();
     c.dots = dots.data_ptr<float>();
     c.post = post_p;
@@ -429,7 +446,7 @@ void gr_mix_cpu
     std::lock_guard<std::mutex> lock(g_pool_mutex);
     g_pool.ensure(nw);
     c.bar.store(0, std::memory_order_relaxed);
-    g_pool.run(&gr_pool_fn, &c, nw);
+    g_pool.run(bf16 ? &gr_pool_fn<true> : &gr_pool_fn<false>, &c, nw);
 }
 
 #else  // !x86
