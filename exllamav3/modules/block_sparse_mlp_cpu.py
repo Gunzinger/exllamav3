@@ -31,7 +31,8 @@ def _routing_std_cpu(bsz, cfg, y, params):
             selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
         else:
             _, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
-        ext.router_std_cpu(cfg.gate_tensor_t, y, selected_experts, routing_weights)
+        if not ext.router_std_cpu(cfg.gate_tensor_t, y, selected_experts, routing_weights):
+            return routing_std(bsz, cfg, y, params)
         return selected_experts, routing_weights
     return routing_std(bsz, cfg, y, params)
 

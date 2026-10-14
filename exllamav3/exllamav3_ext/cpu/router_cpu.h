@@ -15,7 +15,9 @@
 //   y:                (M, K) fp16, contiguous router input
 //   selected_experts: (M, k) int64 out
 //   routing_weights:  (M, k) fp16 out
-void router_std_cpu
+// Returns false when any row's rank-k/k+1 boundary is an fp16 tie (torch's radix topk may pick
+// a different tied subset); the caller then redoes the batch on the torch path for exact parity.
+bool router_std_cpu
 (
     const at::Tensor& gate_t,
     const at::Tensor& y,

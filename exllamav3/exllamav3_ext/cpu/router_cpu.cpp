@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <utility>
 #include <vector>
 #include <immintrin.h>
@@ -82,7 +83,7 @@ ROUTER_TARGET_AVX512 inline void router_logits_row(
 
 } // namespace
 
-void router_std_cpu
+bool router_std_cpu
 (
     const at::Tensor& gate_t,
     const at::Tensor& y,
@@ -137,6 +138,25 @@ void router_std_cpu
             }
         }
 
+        // Tie guard: any equal-value pair inside the selection reorders equal-weight expert
+        // contributions in the moe kernel (fp sum order), and a rank-k/k+1 boundary tie can pick
+        // a different subset under torch's radix topk. Either way the caller redoes the batch on
+        // the torch path for exact parity; untied rows (the common case) take the fast path.
+        bool tied = false;
+        for (int j = 0; j + 1 < n; j++) if (tv[j] == tv[j + 1]) { tied = true; break; }
+        if (!tied && n == TK && TK < E)
+        {
+            float bnd = -std::numeric_limits<float>::infinity();
+            for (int64_t e = 0; e < E; e++)
+            {
+                bool in = false;
+                for (int j = 0; j < n; j++) if (ti[j] == e) { in = true; break; }
+                if (!in && l[e] > bnd) bnd = l[e];
+            }
+            if (bnd == tv[TK - 1]) tied = true;
+        }
+        if (tied) return false;
+
         // Softmax over the selection (norm_topk_prob): max is tv[0] (sorted descending)
         float es[ROUTER_MAX_TOPK];
         float sum = 0.0f;
@@ -152,6 +172,7 @@ void router_std_cpu
             w_p[m * TK + j] = c10::Half(es[j] / denom);
         }
     }
+    return true;
 }
 
 bool router_std_cpu_has_avx512()
@@ -166,9 +187,10 @@ bool router_std_cpu_has_avx512()
 #include "router_cpu.h"
 #include <torch/extension.h>
 
-void router_std_cpu(const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&)
+bool router_std_cpu(const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&)
 {
     TORCH_CHECK(false, "router_std_cpu is x86-only");
+    return false;
 }
 
 bool router_std_cpu_has_avx512() { return false; }
