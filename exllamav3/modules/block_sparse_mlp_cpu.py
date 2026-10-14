@@ -3,6 +3,37 @@ from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
+from .block_sparse_mlp_routing import _routing_buffers, routing_std
+
+# C5 fused CPU router (ext.router_std_cpu): one AVX-512 C++ call per layer for the "std"
+# routing type; EXL3_ROUTER_CPP=0 restores the torch path for A/B testing
+_router_cpp = os.environ.get("EXL3_ROUTER_CPP", "1") != "0"
+
+def _routing_std_cpu(bsz, cfg, y, params):
+    """Fast path through ext.router_std_cpu (fp16 GEMV with fp32 accumulation rounded to half
+    logits, top-k with torch's tie order, softmax over the selection), mirroring routing_std's
+    buffer selection. Falls back to the torch path whenever anything is unusual: non-"std"
+    semantics inputs (per-expert scale, activate_all_experts), non-half or non-contiguous
+    tensors, non-CPU devices or a missing AVX-512 tier."""
+    if (_router_cpp
+            and ext.router_std_cpu_has_avx512()
+            and bsz <= 8   # decode/MTP window sizes; prefill-sized row counts keep the torch path
+            and y.device.type == "cpu" and y.dtype == torch.half and y.is_contiguous()
+            and cfg.gate_tensor is not None
+            and cfg.gate_tensor.dtype == torch.half and cfg.gate_tensor.is_contiguous()
+            and cfg.gate_tensor.device.type == "cpu"
+            and cfg.per_expert_scale is None
+            and not params.get("activate_all_experts")):
+        if cfg.gate_tensor_t is None or cfg.gate_tensor_t.device != y.device \
+                or cfg.gate_tensor_t.dtype != torch.half:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        if bsz == 1:
+            selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+        else:
+            _, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+        ext.router_std_cpu(cfg.gate_tensor_t, y, selected_experts, routing_weights)
+        return selected_experts, routing_weights
+    return routing_std(bsz, cfg, y, params)
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
@@ -270,7 +301,10 @@ class BlockSparseMLP_CPU:
         else:
             z = y
         if self.routing_gate is not None:
-            selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
+            if self.router_type == "std":
+                selected_experts, routing_weights = _routing_std_cpu(bsz, self.routing_cfg, z, params)
+            else:
+                selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
         else:
             selected_experts = torch.zeros((bsz, self.num_experts_per_tok), dtype = torch.long)
             routing_weights = torch.ones((bsz, self.num_experts_per_tok), dtype = torch.half)
