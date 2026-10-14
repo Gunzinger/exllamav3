@@ -169,6 +169,7 @@ class PLELayer(Module):
         # would register it as a cache module
         self.stub = stub
         self.tp_owner = None
+        self._kv_w_f32 = None
         if stub:
             self.ple_embedding = self.key_proj = self.value_proj = None
             self.norm_key = self.norm_query = self.norm_conv = None
@@ -244,6 +245,7 @@ class PLELayer(Module):
             rl.free()
         super().unload()
         self.conv_w = None
+        self._kv_w_f32 = None
 
     @override
     def get_tensors(self):
@@ -381,7 +383,7 @@ class PLELayer(Module):
         H, D = self.hc_mult, self.hidden_size
         emb = self.ple_embedding.forward(token_history, params)               # (bsz, seq, ple_dim)
         if self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
-                and streams.dtype == torch.float and streams.is_contiguous() \
+                and streams.dtype == torch.float and streams.is_contiguous() and streams.is_cuda \
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None:
             emb = emb.contiguous()
             # Row slabs: the ext call keeps six or so full-width fp32/fp16 working tensors of
@@ -413,7 +415,73 @@ class PLELayer(Module):
                 streams[:, t0:t1].add_(delta)
                 cs = conv_stream[:, :, -self.conv_state_len:].contiguous()
             return None, conv_stream
+        if seq == 1 and streams.device.type == "cpu" \
+                and self.key_proj.quant_type == "fp16" and self.value_proj.quant_type == "fp16" \
+                and streams.dtype == torch.float and streams.is_contiguous() and emb.is_contiguous() \
+                and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None \
+                and self.key_proj.inner.weight.shape == (self.ple_embed_dim, H * D) \
+                and self.value_proj.inner.weight.shape == (self.ple_embed_dim, D):
+            return self.forward_streams_cpu(streams, emb, conv_state)
         return self.forward_streams_reference(streams, emb, params, conv_state)
+
+    def _short_conv_decode(self, x: torch.Tensor, conv_state: torch.Tensor | None):
+        """
+        _short_conv at seqlen 1: the dilated conv reads its taps straight from the state window
+        (columns k * dilation) and the new column, so the per-channel F.conv1d (pathologically
+        slow over hc channels on CPU) reduces to a (hc, kernel) dot. The full padded column
+        stream is still materialized: its trailing conv_state_len columns are the next chunk's
+        conv state, shifted by one.
+        """
+        bsz, _, ch = x.shape
+        x2 = x.transpose(1, 2)                                       # (bsz, ch, 1)
+        if conv_state is None:
+            conv_state = x2.new_zeros((bsz, ch, self.conv_state_len))
+        xt = torch.cat((conv_state.to(x2.dtype), x2), dim = -1)      # (bsz, ch, state + 1)
+        w = self.conv_w.view(ch, self.conv_kernel_size).float()
+        y = (xt[:, :, ::self.conv_dilation].float() * w).sum(-1, keepdim = True)
+        # F.conv1d returns half (silu reads the rounded conv output, not the fp32 accumulator)
+        return F.silu(y.to(torch.half)).transpose(1, 2), xt
+
+    def forward_streams_cpu(self, streams, emb, conv_state = None):
+        """CPU decode fast path (seqlen 1), same math and rounding points as
+        forward_streams_reference: the key/value projections run as two fp32 GEMVs over cached
+        casts of the fp16 weights — same shapes, and so the same kernel and rounding, as the
+        reference's per-step matmuls — and the gate dot reuses the reference's bmm form: both
+        keep the outputs bit-identical where the values are half-quantized, so greedy decoding
+        follows the reference at argmax ties. Only the conv differs numerically (shift-register
+        dot vs F.conv1d, <= 1 fp16 ulp, see _short_conv_decode)."""
+        bsz, seq = streams.shape[:2]
+        H, D = self.hc_mult, self.hidden_size
+        w = self._kv_w_f32
+        if w is None:
+            w = (self.key_proj.inner.weight.float(), self.value_proj.inner.weight.float())
+            self._kv_w_f32 = w
+        emb2d = emb.view(-1, self.ple_embed_dim).float()
+        key = torch.matmul(emb2d, w[0]).to(torch.half).view(bsz, seq, H, D).float()
+        value = torch.matmul(emb2d, w[1]).to(torch.half).view(bsz, seq, D).float()
+        eps = self.norm_key.rms_norm_eps
+        kf = key.view(bsz * seq, H, D)
+        rk = torch.rsqrt(kf.square().mean(-1, keepdim = True) + eps) * self.norm_key.constant_scale
+        wk = self.norm_key.weight.data.view(H, D).float() + self.norm_key.constant_bias
+        keyn = kf * rk * wk.unsqueeze(0)
+        qf = streams.view(bsz * seq, H, D)
+        rq = torch.rsqrt(qf.square().mean(-1, keepdim = True) + eps) * self.norm_query.constant_scale
+        wq = self.norm_query.weight.data.view(H, D).float() + self.norm_query.constant_bias
+        queryn = qf * rq * wq.unsqueeze(0)
+        gate = torch.bmm(queryn.view(-1, 1, D), keyn.reshape(-1, D, 1)).view(bsz, seq, H)
+        g = gate * self.gate_scale
+        a = g.abs().clamp_min(1e-6).sqrt()
+        ss = torch.where(g > 0, a, torch.where(g < 0, -a, torch.zeros_like(a)))
+        s = torch.sigmoid(ss).unsqueeze(-1)
+        gated = (s * value.unsqueeze(2)).contiguous()
+        nf = gated.view(bsz * seq * H, D)
+        rn = torch.rsqrt(nf.square().mean(-1, keepdim = True) + eps) * self.norm_conv.constant_scale
+        wc = self.norm_conv.weight.data.view(H, D).float() + self.norm_conv.constant_bias
+        normed = (nf.view(bsz, seq, H, D) * rn.view(bsz, seq, H, 1) * wc.unsqueeze(0)) \
+            .to(torch.half).view(bsz, seq, H * D)
+        conv_out, conv_stream = self._short_conv_decode(normed, conv_state)
+        delta = gated + conv_out.view(bsz, seq, H, D)
+        return delta, conv_stream
 
     def forward_streams_reference(self, streams, emb, params, conv_state = None):
         """Op-by-op form of forward_streams (torch + individual ext kernels)."""
@@ -426,8 +494,15 @@ class PLELayer(Module):
         # per-stream key/query dots as a batched (1, D) x (D, 1) matmul, then the fused gate
         # kernel: gated = sigmoid(signed_sqrt(dot * scale)) * value broadcast over streams
         gate = torch.bmm(query.view(-1, 1, D), key.reshape(-1, D, 1)).view(bsz, seq, H)
-        gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
-        ext.ple_gate(gate, value, gated, self.gate_scale)
+        if gate.is_cuda:
+            gated = torch.empty((bsz, seq, H, D), dtype = torch.float, device = value.device)
+            ext.ple_gate(gate, value, gated, self.gate_scale)
+        else:
+            g = gate * self.gate_scale
+            a = g.abs().clamp_min(1e-6).sqrt()
+            ss = torch.where(g > 0, a, torch.where(g < 0, -a, torch.zeros_like(a)))
+            s = torch.sigmoid(ss).unsqueeze(-1)
+            gated = (s * value.float().unsqueeze(2)).contiguous()
         normed = self.norm_conv.forward(gated, params, out_dtype = torch.half).flatten(-2)
         conv_out, conv_stream = self._short_conv(normed, conv_state)
         delta = gated + conv_out.view(bsz, seq, H, D)

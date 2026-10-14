@@ -6,6 +6,155 @@ from ...util.tensor import get_for_device, buffered_arange
 # The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
 # they are imported on first use rather than with the library
 
+
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.rsqrt((x * x).sum(dim = -1, keepdim = True) + 1e-6)
+
+
+def torch_recurrent_gated_delta_rule_cpu(
+    mixed_qkv: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    recurrent_state: torch.Tensor | None,
+    recurrent_slots: torch.Tensor | None,
+    history: bool,
+    save_state: bool,
+    num_k_heads: int,
+    num_v_heads: int,
+    k_dim: int,
+    v_dim: int,
+    k_head_dim: int,
+    v_head_dim: int,
+    slots_in: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Sequential grouped delta rule on CPU tensors, mirroring ext.cuda_recurrent_gated_delta_rule
+    (gdn.cu: cuda_recurrent_gated_delta_rule_kernel: in-kernel q/k l2norm, per-v-head beta/g
+    over the shared k-head's state, intermediate states into the history slots, output bf16)
+
+    slots_in: base rows a speculative pass (history) reads its initial state from, writing the
+    final state to the scratch rows in recurrent_slots; no intermediate states are stored (the
+    rewind replays the staged scan inputs), matching the CUDA kernel's slots_in semantics
+    """
+    bsz, seqlen, _ = mixed_qkv.shape
+    group = num_v_heads // num_k_heads
+    scale = k_head_dim ** -0.5
+
+    q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+    q = _l2norm(q.float().view(bsz, seqlen, num_k_heads, k_head_dim)).repeat_interleave(group, dim = 2)
+    k = _l2norm(k.float().view(bsz, seqlen, num_k_heads, k_head_dim)).repeat_interleave(group, dim = 2)
+    v = v.view(bsz, seqlen, num_v_heads, v_head_dim).float()
+    decay = g.float().exp()
+    beta = beta.float()
+
+    if recurrent_state is None:
+        state = torch.zeros(bsz, num_v_heads, k_head_dim, v_head_dim, dtype = torch.float)
+        idx = None
+    else:
+        idx = recurrent_slots.long() if recurrent_slots is not None else None
+        in_idx = slots_in.long() if slots_in is not None else idx
+        state = (recurrent_state[in_idx, 0] if in_idx is not None else recurrent_state[:bsz, 0]).clone()
+
+    # The step math is expressed as batched GEMMs over (bsz * nv, dk, dv): the broadcast
+    # elementwise form moves the fp32 state through ~5 full-size temporaries per token
+    state3 = state.view(bsz * num_v_heads, k_head_dim, v_head_dim)
+    out = torch.empty(bsz, seqlen, num_v_heads, v_head_dim, dtype = torch.bfloat16)
+    for t in range(seqlen):
+        kt = k[:, t].unsqueeze(-1)
+        kv_mem = torch.matmul(kt.transpose(-1, -2), state)
+        u = (v[:, t].unsqueeze(-2) - kv_mem * decay[:, t, :, None, None]) * beta[:, t, :, None, None]
+        state3.mul_(decay[:, t].reshape(-1, 1, 1))
+        state3.baddbmm_(kt.reshape(-1, k_head_dim, 1), u.reshape(-1, 1, v_head_dim))
+        out[:, t] = (torch.matmul(q[:, t].unsqueeze(-2), state).squeeze(-2) * scale).to(torch.bfloat16)
+        if history and slots_in is None and t < seqlen - 1 and recurrent_state is not None:
+            if idx is not None:
+                recurrent_state[idx, t + 1] = state
+            else:
+                recurrent_state[:bsz, t + 1] = state
+
+    if save_state and recurrent_state is not None:
+        if idx is not None:
+            recurrent_state[idx, 0] = state
+        else:
+            recurrent_state[:bsz, 0] = state
+    return out
+
+
+def torch_chunk_gated_delta_rule_cpu(
+    mixed_qkv: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    recurrent_state: torch.Tensor | None,
+    recurrent_slots: torch.Tensor | None,
+    save_state: bool,
+    num_k_heads: int,
+    num_v_heads: int,
+    k_dim: int,
+    v_dim: int,
+    k_head_dim: int,
+    v_head_dim: int,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """
+    Chunked delta rule on CPU tensors: WY form of the sequential recurrence, chunk-local decay
+    cumsum G, A = tril(beta_i (k_i . k_j) e^{G_i - G_j}), state carried in fp32. Verified
+    against torch_recurrent_gated_delta_rule (the decode-kernel semantics) to fp64 precision;
+    the h-readback rows of w carry the e^G decay to the token's position, which is where the
+    naive transcription of the fla kernels (w = (I+A)^-1 beta k) drifts ~5e-2
+    """
+    bsz, seqlen, _ = mixed_qkv.shape
+    group = num_v_heads // num_k_heads
+    scale = k_head_dim ** -0.5
+    C = chunk_size
+
+    q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+    q = _l2norm(q.float().view(bsz, seqlen, num_k_heads, k_head_dim)).repeat_interleave(group, dim = 2)
+    k = _l2norm(k.float().view(bsz, seqlen, num_k_heads, k_head_dim)).repeat_interleave(group, dim = 2)
+    v = v.view(bsz, seqlen, num_v_heads, v_head_dim).float()
+    beta = beta.float()
+    g = g.float()
+
+    out = torch.empty(bsz, seqlen, num_v_heads, v_head_dim, dtype = torch.bfloat16)
+
+    for bi in range(bsz):
+        slot = int(recurrent_slots[bi]) if recurrent_slots is not None else bi
+        h = recurrent_state[slot, 0].clone() if recurrent_state is not None \
+            else torch.zeros(num_v_heads, k_head_dim, v_head_dim, dtype = torch.float)
+        beta_b = beta[bi]
+        g_b = g[bi]
+        for t0 in range(0, seqlen, C):
+            t1 = min(t0 + C, seqlen)
+            c = t1 - t0
+            qc = q[bi, t0:t1].transpose(0, 1)
+            kc = k[bi, t0:t1].transpose(0, 1)
+            vc = v[bi, t0:t1].transpose(0, 1)
+            bc = beta_b[t0:t1].transpose(0, 1)
+            G = g_b[t0:t1].transpose(0, 1).cumsum(dim = -1)
+            D = G.unsqueeze(-1) - G.unsqueeze(-2)
+            eye = torch.eye(c).expand(num_v_heads, c, c)
+
+            strict = torch.ones(c, c, dtype = torch.bool).tril(-1)
+            A = kc @ kc.transpose(-1, -2)
+            A = A * D.masked_fill(~strict, float("-inf")).exp() * bc.unsqueeze(-1)
+            t_inv = torch.linalg.solve_triangular(eye + A, eye, upper = False)
+
+            w = t_inv @ ((bc * G.exp()).unsqueeze(-1) * kc)
+            u = t_inv @ (bc.unsqueeze(-1) * vc)
+            v_new = u - w @ h
+
+            G_last = G[:, -1]
+            incl = torch.ones(c, c, dtype = torch.bool).tril(0)
+            o = (qc @ h) * G.exp()[:, :, None]
+            o = o + (qc @ kc.transpose(-1, -2) *
+                     D.masked_fill(~incl, float("-inf")).exp()) @ v_new
+            out[bi, t0:t1] = (o * scale).transpose(0, 1).to(torch.bfloat16)
+
+            h = h * G_last.exp()[:, None, None] + \
+                kc.transpose(-1, -2) @ (v_new * (G_last[:, None] - G).exp()[:, :, None])
+        if save_state and recurrent_state is not None:
+            recurrent_state[slot, 0] = h
+    return out
+
 def torch_recurrent_gated_delta_rule(
     query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
 ):
@@ -140,6 +289,26 @@ def gated_delta_rule_fn(
         params = {}
 
     bsz, seqlen, _ = mixed_qkv.shape
+
+
+    # CPU paths: the chunked scan for prefill (same shape split as the fla kernels below), the
+    # sequential recurrence -- the decode math -- otherwise. KDA (channelwise decay) stays on
+    # the CUDA kernels
+    if mixed_qkv.device.type == "cpu" and not channelwise_g:
+        if seqlen >= num_v_heads and not history:
+            return torch_chunk_gated_delta_rule_cpu(
+                mixed_qkv, beta, g, recurrent_state, recurrent_slots, save_state,
+                num_k_heads, num_v_heads, k_dim, v_dim, k_head_dim, v_head_dim,
+            )
+        return torch_recurrent_gated_delta_rule_cpu(
+            mixed_qkv, beta, g, recurrent_state, recurrent_slots, history, save_state,
+            num_k_heads, num_v_heads, k_dim, v_dim, k_head_dim, v_head_dim,
+            slots_in,
+        )
+
+    # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
+    # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
+
 
     # recurrent_state rows: recurrent_slots are the rows the pass writes (and reads, except that
     # a speculative pass -- history -- reads each row's initial state from slots_in and leaves it

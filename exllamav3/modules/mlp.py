@@ -11,6 +11,7 @@ from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
+from ..util import activation as act_mul
 
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
 
@@ -717,9 +718,9 @@ class GatedMLP(Module):
                 a = b
 
         match activation_fn:
-            case "silu": self.activation_fn_call = ext.silu_mul
-            case "relu2": self.activation_fn_call = ext.relu2_mul
-            case "gelu": self.activation_fn_call = ext.gelu_mul
+            case "silu": self.activation_fn_call = act_mul.silu_mul
+            case "relu2": self.activation_fn_call = act_mul.relu2_mul
+            case "gelu": self.activation_fn_call = act_mul.gelu_mul
 
         self.tp_reduce = False
         self.multi_gu: list[MultiLinear | None] = [None] * self.num_slices

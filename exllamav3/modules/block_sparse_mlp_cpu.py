@@ -3,6 +3,38 @@ from typing_extensions import override
 import os
 import torch
 from ..ext import exllamav3_ext as ext
+from .block_sparse_mlp_routing import _routing_buffers, routing_std
+
+# C5 fused CPU router (ext.router_std_cpu): one AVX-512 C++ call per layer for the "std"
+# routing type; EXL3_ROUTER_CPP=0 restores the torch path for A/B testing
+_router_cpp = os.environ.get("EXL3_ROUTER_CPP", "1") != "0"
+
+def _routing_std_cpu(bsz, cfg, y, params):
+    """Fast path through ext.router_std_cpu (fp16 GEMV with fp32 accumulation rounded to half
+    logits, top-k with torch's tie order, softmax over the selection), mirroring routing_std's
+    buffer selection. Falls back to the torch path whenever anything is unusual: non-"std"
+    semantics inputs (per-expert scale, activate_all_experts), non-half or non-contiguous
+    tensors, non-CPU devices or a missing AVX-512 tier."""
+    if (_router_cpp
+            and ext.router_std_cpu_has_avx512()
+            and bsz <= 8   # decode/MTP window sizes; prefill-sized row counts keep the torch path
+            and y.device.type == "cpu" and y.dtype == torch.half and y.is_contiguous()
+            and cfg.gate_tensor is not None
+            and cfg.gate_tensor.dtype == torch.half and cfg.gate_tensor.is_contiguous()
+            and cfg.gate_tensor.device.type == "cpu"
+            and cfg.per_expert_scale is None
+            and not params.get("activate_all_experts")):
+        if cfg.gate_tensor_t is None or cfg.gate_tensor_t.device != y.device \
+                or cfg.gate_tensor_t.dtype != torch.half:
+            cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
+        if bsz == 1:
+            selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+        else:
+            _, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+        if not ext.router_std_cpu(cfg.gate_tensor_t, y, selected_experts, routing_weights):
+            return routing_std(bsz, cfg, y, params)
+        return selected_experts, routing_weights
+    return routing_std(bsz, cfg, y, params)
 
 # Kernel-fused issue/collect for decode-size split jobs (EXL3_MOE_SPLIT_FUSED=0 restores the
 # cudaMemcpyAsync path for A/B testing)
@@ -104,6 +136,238 @@ class BlockSparseMLP_CPU:
         self.cpu_offload = False
         self.cpu_split_first = None   # split offload: first CPU-resident (tail) expert index
         self._split_map = None        # dynamic placement: router id -> physical slot
+        # CPU-only device path (plan A3): the layer was loaded onto CPU tensors and the routed
+        # experts run in-process through the moe_mul1 kernel (no worker, no CUDA handoff)
+        self.cpu_layer = False
+        self.cpu_layer_handle = None
+        self.cpu_shared_handle = None
+        self._cpu_shared_sel = None
+        self._cpu_shared_w = None
+        self.cpu_threads = 0
+        # Packed-trellis upgrade marker: the registrations above hold native-layout bytes
+        # (the deferred loader fills tensors after the module epilogue, so they cannot be
+        # repacked at registration); _cpu_swz_upgrade moves them at first forward
+        self._cpu_swz_checked = False
+
+    @staticmethod
+    def _cpu_default_threads() -> int:
+        # Same fallback chain as MoeCpuTuning (moe_cpu_host.py), without importing it: that
+        # module pulls the CUDA TP helpers at import time
+        from ..model.moe_cpu_affinity import default_worker_threads
+        _, n_phys = ext.exl3_moe_cpu_core_order()
+        host_cores = int(os.environ.get("EXL3_MOE_HOST_CORES", 1))
+        return int(os.environ.get(
+            "EXL3_MOE_CPU_THREADS",
+            default_worker_threads(n_phys, host_cores) if n_phys and host_cores > 0
+            else max(1, (os.cpu_count() or 2) // 2)))
+
+    def _shared_register(self) -> None:
+        """Register the shared expert with the in-process moe_mul1 kernel as a one-expert
+        layer (the same fused gate/up/act/down call the routed experts take, weights fixed
+        to 1) when it is eligible: single-slice GatedMLP, silu/gelu, mul1 codebook, no bias,
+        dims the kernel accepts. Leaves cpu_shared_handle = None otherwise and cpu_forward
+        keeps the GatedMLP torch path."""
+        sh = self.shared_experts
+        if sh is None or sh.num_slices != 1:
+            return
+        if sh.interm_div != 1.0 or sh.activation_fn not in ("silu", "gelu"):
+            return
+        proj = [sh.gates[0], sh.ups[0], sh.downs[0]]
+        if not all(l.quant_type == "exl3" and l.inner.mul1 and l.inner.bias is None for l in proj):
+            return
+        def ok(l):
+            t = l.inner.trellis
+            return (
+                t.device.type == "cpu" and t.is_contiguous() and
+                t.size(0) * 16 % 128 == 0 and t.size(1) * 16 % 128 == 0 and
+                trellis_rate(t.size(2)) is not None
+            )
+        if not all(ok(l) for l in proj):
+            print(f" !! {self.key}: shared expert not eligible for the CPU MoE kernel, using the torch path")
+            return
+        if self.cpu_shared_handle is not None:
+            ext.exl3_moe_cpu_free_layer(self.cpu_shared_handle)
+            self.cpu_shared_handle = None
+        # The registered layer holds its own tensor references (moe_mul1.cpp MoeCpuLayer::refs)
+        def tensors(l, attr):
+            return [getattr(l.inner, attr).contiguous()]
+        g, u, d = sh.gates[0], sh.ups[0], sh.downs[0]
+        swz = int(all(l.inner.cpu_swz for l in proj))
+        self.cpu_shared_handle = ext.exl3_moe_cpu_make_layer(
+            tensors(g, "trellis"), tensors(g, "suh"), tensors(g, "svh"),
+            tensors(u, "trellis"), tensors(u, "suh"), tensors(u, "svh"),
+            tensors(d, "trellis"), tensors(d, "suh"), tensors(d, "svh"),
+            [], [], [],
+            {"silu": 0, "gelu": 1}[sh.activation_fn],
+            float(sh.act_limit or 0.0),
+            swz,
+        )
+
+    def load_local_cpu(self, **kwargs) -> None:
+        """CPU-device load epilogue (BlockSparseMLP.load with device.type == "cpu"): the
+        per-expert Linears have already loaded their tensors onto the CPU through the normal
+        path; register the whole expert set with the in-process moe_mul1 kernel when the
+        configuration is eligible (gated silu/gelu/swiglu_oai or gateless relu2, mul1 codebook,
+        no per-expert biases). Ineligible layers keep cpu_layer_handle = None and forward()
+        falls back to the per-expert torch path."""
+        self.cpu_layer = True
+        self.cpu_threads = self._cpu_default_threads()
+        self._shared_register()
+        act = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn]
+        experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
+        # is_quantized is load_local() state, which the CUDA epilogue computes; derive it here
+        # (load_local never runs on a CPU load)
+        eligible = (
+            all(ls for ls in experts) and
+            all(l.quant_type == "exl3" and l.inner.mul1 and l.inner.bias is None
+                for ls in experts for l in ls) and
+            (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated
+             else self.activation_fn == "relu2")
+        )
+        if not eligible:
+            print(f" !! {self.key}: experts not eligible for the CPU MoE kernel, using the torch path")
+            return
+        if self.cpu_layer_handle is not None:
+            ext.exl3_moe_cpu_free_layer(self.cpu_layer_handle)
+            self.cpu_layer_handle = None
+        self._register_routed()
+
+    def _cpu_swz_upgrade(self):
+        """First-forward upgrade of the registered moe handles to the packed trellis layout:
+        repack each projection's trellis in place (the registrations hold pointers into that
+        storage) and re-register with the packed flag. Only safe after the loader's deferred
+        fills have landed, i.e. from the first forward; dense linears upgrade lazily at their
+        own first call (LinearEXL3.cpu_repack). All-or-nothing per handle."""
+        if self._cpu_swz_checked:
+            return
+        self._cpu_swz_checked = True
+        if os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") == "0":
+            return
+        def upgrade(linears, reregister):
+            if not all(l.inner.cpu_can_swizzle() for l in linears):
+                return
+            for l in linears:
+                l.inner.cpu_repack(inplace = True)
+            reregister()
+        if self.cpu_shared_handle is not None:
+            sh = self.shared_experts
+            upgrade([sh.gates[0], sh.ups[0], sh.downs[0]], self._shared_register)
+        if self.cpu_layer_handle is not None:
+            experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
+            upgrade([l for ls in experts for l in ls], self._register_routed)
+
+    def _register_routed(self):
+        """(Re-)register the routed experts with the in-process moe_mul1 kernel."""
+        act = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn]
+        experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
+
+        def tensors(ls, attr):
+            return [getattr(l.inner, attr).contiguous() for l in ls]
+        gate_t = ([tensors(self.gates, a) for a in ("trellis", "suh", "svh")]
+                  if self.gated else [[], [], []])
+        up_t = [tensors(self.ups, a) for a in ("trellis", "suh", "svh")]
+        down_t = [tensors(self.downs, a) for a in ("trellis", "suh", "svh")]
+        # Packed trellis layout flag: all-or-nothing per layer (one swizzled arg for the whole
+        # registration). At load time the Linears are still native (their packed-layout upgrade
+        # happens at first forward, _cpu_swz_upgrade), so this is 0 here
+        swz_flags = {l.inner.cpu_swz for ls in experts for l in ls}
+        swz = 1 if swz_flags == {True} else 0
+        if len(swz_flags) > 1:
+            print(f" !! {self.key}: mixed packed/native trellis, registering native (slower)")
+        # The registered layer holds its own tensor references (moe_mul1.cpp MoeCpuLayer::refs),
+        # so the handle stays valid independently of the Linears' inner tensors
+        self.cpu_layer_handle = ext.exl3_moe_cpu_make_layer(
+            *gate_t, *up_t, *down_t,
+            [], [], [],
+            act,
+            float(self.act_limit or 0.0),
+            swz,
+        )
+
+    def cpu_forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None):
+        """CPU-only BlockSparseMLP.forward: torch routing, the in-process moe_mul1 expert
+        kernel (or the per-expert torch path), shared experts and the sigmoid shared gate in
+        torch. Mirrors the CUDA forward's contract: fp32 routed sum, out per the module's
+        out_dtype (float)."""
+        self._cpu_swz_upgrade()
+        y = x.view(-1, self.hidden_size)
+        if self.alt_residual_channel:
+            y = params["residual"].view(-1, self.hidden_size)
+        if not y.is_contiguous():
+            y = y.contiguous()
+        bsz = y.shape[0]
+
+        if self.router_pre_norm is not None:
+            z = self.router_pre_norm.forward(y, params, out_dtype = torch.half)
+        else:
+            z = y
+        if self.routing_gate is not None:
+            if self.router_type == "std":
+                selected_experts, routing_weights = _routing_std_cpu(bsz, self.routing_cfg, z, params)
+            else:
+                selected_experts, routing_weights = self.routing_fn(bsz, self.routing_cfg, z, params)
+        else:
+            selected_experts = torch.zeros((bsz, self.num_experts_per_tok), dtype = torch.long)
+            routing_weights = torch.ones((bsz, self.num_experts_per_tok), dtype = torch.half)
+        if self.routed_pre_norm is not None:
+            y = self.routed_pre_norm.forward(y, params, out_dtype = torch.half)
+        assert self.latent_in is None, "latent MoE has no CPU path"
+
+        if self.intermediate_size == 0 or self.num_local_experts == 0 or bsz == 0:
+            final_hidden_states = torch.zeros((bsz, self.expert_size), dtype = torch.float)
+        elif self.cpu_layer_handle is not None:
+            final_hidden_states = torch.empty((bsz, self.expert_size), dtype = torch.float)
+            ext.exl3_moe_cpu_forward(
+                self.cpu_layer_handle, y, selected_experts, routing_weights,
+                final_hidden_states, self.cpu_threads
+            )
+        else:
+            final_hidden_states = torch.zeros((bsz, self.expert_size), dtype = torch.float)
+            for t in range(bsz):
+                for k in range(self.num_experts_per_tok):
+                    e = int(selected_experts[t, k])
+                    xc = y[t:t + 1]
+                    u = self.ups[e].forward(xc, params)
+                    if self.gated:
+                        g = self.gates[e].forward(xc, params)
+                        a = torch.empty_like(u, dtype = torch.half)
+                        self.activation_fn_call(g, u, a, self.act_limit)
+                    else:
+                        a = self.gateless_act(u)
+                        if a.dtype != torch.half:
+                            a = a.half()
+                    d = self.downs[e].forward(a, params)
+                    final_hidden_states[t] += d.view(-1) * routing_weights[t, k].float()
+
+        if self.routed_post_norm is not None:
+            final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
+
+        if self.shared_experts is not None:
+            if self.cpu_shared_handle is not None:
+                sh_in = x.reshape(-1, self.hidden_size)
+                if not sh_in.is_contiguous():
+                    sh_in = sh_in.contiguous()
+                # Constant selection (expert 0, weight 1): cached per row count, rebuilt when
+                # the batch size changes between decode and prefill chunks
+                sel = self._cpu_shared_sel
+                if sel is None or sel.shape[0] != bsz:
+                    self._cpu_shared_sel = sel = torch.zeros((bsz, 1), dtype = torch.long)
+                    self._cpu_shared_w = torch.ones((bsz, 1), dtype = torch.half)
+                sh = torch.empty((bsz, self.hidden_size), dtype = torch.float)
+                ext.exl3_moe_cpu_forward(self.cpu_shared_handle, sh_in, sel, self._cpu_shared_w, sh, self.cpu_threads)
+            else:
+                sh = self.shared_experts.forward(x, params)
+            if self.shared_experts_post_norm is not None:
+                sh = self.shared_experts_post_norm.forward(sh, params)
+            if self.shared_gate is not None:
+                g = self.shared_gate.forward(x, params)
+                final_hidden_states += sh.view(bsz, -1) * torch.sigmoid(g.view(bsz, 1))
+            else:
+                final_hidden_states += sh.view(bsz, -1)
+
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states.view(x.shape[:-1] + (self.expert_size,))
 
     def cpu_maybe_offload_load(self, device, **kwargs) -> bool:
         """Whole-layer offload claim: when the budget allows and the layer is eligible,
@@ -201,6 +465,13 @@ class BlockSparseMLP_CPU:
             reg.append(self)
 
     def cpu_unload(self):
+        if self.cpu_layer_handle is not None:
+            ext.exl3_moe_cpu_free_layer(self.cpu_layer_handle)
+            self.cpu_layer_handle = None
+        if self.cpu_shared_handle is not None:
+            ext.exl3_moe_cpu_free_layer(self.cpu_shared_handle)
+            self.cpu_shared_handle = None
+        self.cpu_layer = False
         if self.cpu_split_first is not None:
             host = getattr(self, "cpu_host", None)
             if host is not None:

@@ -7,10 +7,12 @@ from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
+from .quant.exl3 import cpu_linear_forward_batch
 from ..ext import exllamav3_ext as ext
 from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from ..util import activation as act
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
@@ -644,10 +646,22 @@ class Attention(Module):
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
+        k = v = None
         if self.multi_qg is None or bsz * q_len > 32:
-            q = self.q_proj.forward(x, params)
+            if (
+                x.device.type == "cpu" and
+                not self.use_k_as_v and
+                self.v_proj is not None and
+                (self.multi_kv is None or bsz * q_len > 32)
+            ):
+                # One worker-pool round set for the same-input Q/K/V projections (CPU kernels)
+                q, k, v = cpu_linear_forward_batch(
+                    [self.q_proj, self.k_proj, self.v_proj], x, params
+                )
+            else:
+                q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
-                if self.head_dim % 8 == 0 and q.dtype == torch.half:
+                if q.is_cuda and self.head_dim % 8 == 0 and q.dtype == torch.half:
                     qg = q
                     q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
                     g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
@@ -692,39 +706,42 @@ class Attention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
-        if self.multi_kv is None or bsz * q_len > 32:
-            k = self.k_proj.forward(x, params)
-            v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
+        if k is None:
+            if self.multi_kv is None or bsz * q_len > 32:
+                k = self.k_proj.forward(x, params)
+                v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
-        else:
-            if x.shape[-1] < self.k_proj.in_features:
-                x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
-            x = x.view(1, bsz * q_len, self.k_proj.in_features)
-            if bsz * q_len == 1:
-                kvh = self.prealloc_kvh_1
-                kv = self.prealloc_kv_1
             else:
-                kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
-                kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
-            ext.exl3_mgemm(
-                x,
-                self.multi_kv.ptrs_trellis,
-                kv,
-                self.multi_kv.ptrs_suh,
-                kvh,
-                self.multi_kv.ptrs_svh,
-                None,
-                None,
-                self.multi_kv.K,
-                -1,
-                self.multi_kv.mcg,
-                self.multi_kv.mul1,
-                -1,
-                -1,
-                0,
-                1, None, None)
-            k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
-            v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+                # Unlike Linear.forward, the fused path doesn't zero-extend the input for padded
+                # in_features, so do it here (K is the padded width the mgemm kernel reads)
+                if x.shape[-1] < self.k_proj.in_features:
+                    x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
+                x = x.view(1, bsz * q_len, self.k_proj.in_features)
+                if bsz * q_len == 1:
+                    kvh = self.prealloc_kvh_1
+                    kv = self.prealloc_kv_1
+                else:
+                    kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
+                    kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
+                ext.exl3_mgemm(
+                    x,
+                    self.multi_kv.ptrs_trellis,
+                    kv,
+                    self.multi_kv.ptrs_suh,
+                    kvh,
+                    self.multi_kv.ptrs_svh,
+                    None,
+                    None,
+                    self.multi_kv.K,
+                    -1,
+                    self.multi_kv.mcg,
+                    self.multi_kv.mul1,
+                    -1,
+                    -1,
+                    0,
+                    1, None, None)
+                k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
+                v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
         return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
@@ -945,9 +962,9 @@ class Attention(Module):
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
-            else: ext.mul_sigmoid_broadcast_(o, g)
+            else: act.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate or self.interleaved_gate: act.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
@@ -961,7 +978,7 @@ class Attention(Module):
         """
         from ..cache import CacheLayer
 
-        if cache is None or x.dtype != torch.float16 or not x.is_contiguous():
+        if x.device.type == "cpu" or cache is None or x.dtype != torch.float16 or not x.is_contiguous():
             return None
         if params.get("sim_kvq") is not None:
             return None
@@ -1208,9 +1225,9 @@ class Attention(Module):
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
-            else: ext.mul_sigmoid_broadcast_(o, g)
+            else: act.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        if self.full_gate or self.interleaved_gate: act.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o

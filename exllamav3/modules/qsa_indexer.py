@@ -38,6 +38,59 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     return torch.cat((x_rope * cos + rot * sin, x_pass), dim = -1)
 
 
+def _gather_ws(numel: int, device, tag: str, dtype: torch.dtype = torch.float) -> torch.Tensor:
+    """Bucketed static buffer for the gathered K/V pages (decode-hot: re-gathering up to the
+    token budget per layer per step reallocates multi-MB buffers and re-faults their pages
+    every call)."""
+    from ..util.tensor import g_tensor_cache
+    return g_tensor_cache.get_bucketed(device, numel, dtype, tag)
+
+
+def _attend_rows_gather(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    seq: int,
+    block_table: torch.Tensor | None = None,
+    page_size: int = 0,
+) -> torch.Tensor:
+    """
+    CPU gathered-GQA attention, one -1-padded index list per query row (the torch mirror of
+    qsa_sparse_attend_rows): gathers this row's K/V rows -- flat rows without a block table,
+    per-sequence cache positions mapped through one when given -- and runs fp32
+    softmax-attention grouped per kv head (q head h reads kv head h // group, as in the split
+    kernel). q (R, H, D), k/v (rows, kvh, D), indices (R, K_pad) int32. Returns (R, H, D) fp16.
+    """
+    R, H, hd = q.shape
+    kvh = k.shape[1]
+    group = H // kvh
+    bt = block_table.long() if block_table is not None else None
+    o = torch.empty((R, H, hd), dtype = torch.half)
+    for r in range(R):
+        idx = indices[r]
+        idx = idx[idx >= 0].long()
+        if bt is not None:
+            idx = bt[r // seq, idx // page_size] * page_size + idx % page_size
+        L = idx.shape[0]
+        n = L * kvh * hd
+        kh = _gather_ws(n, k.device, "qsa_gather_k", k.dtype)[:n].view(L, kvh, hd)
+        vh = _gather_ws(n, v.device, "qsa_gather_v", v.dtype)[:n].view(L, kvh, hd)
+        torch.index_select(k, 0, idx, out = kh)
+        torch.index_select(v, 0, idx, out = vh)
+        kk = _gather_ws(n, k.device, "qsa_gather_kf")[:n].view(L, kvh, hd)
+        vv = _gather_ws(n, v.device, "qsa_gather_vf")[:n].view(L, kvh, hd)
+        kk.copy_(kh)
+        vv.copy_(vh)
+        # scores per kv head over its q-head group: no (n, H, hd) expansion (the gather is
+        # decode-hot; expanding 24 heads x 256 dims x ~2k rows costs ~25 MB per direction)
+        s = torch.einsum("kgd,nkd->kgn", q[r].view(kvh, group, hd).float(), kk) * sm_scale
+        p = torch.softmax(s, dim = -1)
+        o[r] = torch.einsum("kgn,nkd->kgd", p, vv).view(H, hd).half()
+    return o
+
+
 class QSAIndexer(Module):
 
     def __init__(
@@ -373,6 +426,8 @@ class QSAIndexer(Module):
         pooled (bsz, nb, dk). Returns (bsz * seq, K_pad) int32 for the gathered attention
         kernel (K_pad matching the BC selection width).
         """
+        if q_idx.device.type == "cpu":
+            return self.select_indices_ref(q_idx, pooled, past_len, batch_stride)
         bsz, seq = q_idx.shape[:2]
         nb = pooled.shape[1]
         out = torch.empty((bsz * seq, self.k_pad()), dtype = torch.int32, device = q_idx.device)
@@ -430,6 +485,16 @@ class QSAIndexer(Module):
         a materialized (bsz, seq, seq) mask (whose SDPA fallback also expands K/V per q head).
         q (bsz, seq, qh, hd) roped, k/v (bsz, seq, kvh, hd); returns (bsz, seq, qh, hd) fp16.
         """
+        if q.device.type == "cpu":
+            bsz, seq = q.shape[:2]
+            indices = self.select_indices(q_idx, pooled, past_len = 0, batch_stride = seq)
+            o = _attend_rows_gather(
+                q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim),
+                k.reshape(bsz * seq, -1, attn.head_dim),
+                v.reshape(bsz * seq, -1, attn.head_dim),
+                indices, attn.sm_scale, seq,
+            )
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         bsz, seq = q.shape[:2]
         indices = self.select_indices(q_idx, pooled, past_len = 0, batch_stride = seq)
@@ -498,6 +563,8 @@ class QSAIndexer(Module):
         no per-layer H2D copy of the positions, no index arithmetic in torch. The pool kernel
         also writes the chunk's trailing incomplete pool (never selected; rebuilt once complete).
         """
+        if x.device.type == "cpu":
+            return self.update_planes_ref(layer, x, rope, block_table, cache_seqlens_cpu, params)
         from .attention_fn.qsa_triton import _qsa_stage_kernel, _qsa_pool_update_kernel
         from .attention_fn.mla_triton import _mla_plane_update_kernel
         from ..util.tensor import g_tensor_cache, get_for_device
@@ -548,7 +615,9 @@ class QSAIndexer(Module):
         cache_seqlens_cpu: torch.Tensor,
         params: dict,
     ) -> torch.Tensor:
-        """Torch reference of update_planes (tests): writes only the completed pools."""
+        """Torch reference of update_planes (tests): rebuilds every pool the chunk touches,
+        including the trailing incomplete pool (mean over the tokens present, like the Triton
+        pool kernel); partial pools are never selected until they complete."""
         bsz, seqlen, _ = x.shape
         dev = x.device
         cr = self.compress_ratio
@@ -572,18 +641,23 @@ class QSAIndexer(Module):
         flat = bt.gather(1, pos_ids // page_sz) * page_sz + pos_ids % page_sz
         raw_flat[flat.flatten()] = raw_k.reshape(-1, dk).half()
 
-        # pool blocks completed by this chunk: rows have different (b0, b1) ranges; pad to the max
+        # pools touched by this chunk: [pos0 // cr, ceil((pos0 + seqlen) / cr)), the trailing
+        # partial pool rebuilt from the tokens present
         b0 = pos0 // cr
-        b1 = (pos0 + seqlen) // cr
+        b1 = (pos0 + seqlen + cr - 1) // cr
         nb_max = int((b1 - b0).max().item())
         if nb_max > 0:
             blocks = b0.unsqueeze(1) + torch.arange(nb_max, device = dev)          # (bsz, nbm)
             valid = blocks < b1.unsqueeze(1)
             blocks_c = torch.where(valid, blocks, b0.unsqueeze(1))                 # safe indices
             tok = (blocks_c * cr).unsqueeze(-1) + torch.arange(cr, device = dev)   # (bsz, nbm, cr)
+            tok_ok = tok < (pos0 + seqlen).unsqueeze(1).unsqueeze(2)
             tflat = bt.unsqueeze(1).expand(-1, nb_max, -1) \
                 .gather(2, tok // page_sz) * page_sz + tok % page_sz
-            pooled = raw_flat[tflat].float().mean(dim = 2).to(torch.half)          # (bsz, nbm, dk)
+            raw = raw_flat[tflat].float()                                          # (bsz, nbm, cr, dk)
+            cnt = tok_ok.sum(dim = 2, keepdim = True).clamp(min = 1)
+            pooled = torch.where(tok_ok.unsqueeze(-1), raw, torch.zeros_like(raw)).sum(dim = 2) / cnt
+            pooled = pooled.to(torch.half)
             pooled = self.k_layernorm.forward(pooled, params)
             starts = blocks_c * cr
             pooled = _rope(pooled, cos_all[starts].half(), sin_all[starts].half())
@@ -605,6 +679,8 @@ class QSAIndexer(Module):
         position. Emits per-SEQUENCE cache positions, (bsz * seq, K_pad) int32 -1-padded. The
         paged attention kernel maps them through the block table.
         """
+        if q_idx.device.type == "cpu":
+            return self.select_indices_paged_ref(layer, q_idx, block_table, cache_seqlens_cpu)
         bsz, seq = q_idx.shape[:2]
         cr = self.compress_ratio
         epp = layer.pooled.shape[1]
@@ -685,10 +761,21 @@ class QSAIndexer(Module):
         q: (bsz, seq, num_q_heads, head_dim) roped; q_idx: roped indexer queries from
         update_planes. Returns (bsz, seq, num_q_heads, head_dim) fp16.
         """
-        from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        if q.device.type == "cpu":
+            assert not isinstance(layer, CacheLayer_quant), \
+                "QSA CPU path requires an fp16 KV cache (KV=fp16)"
+            o = _attend_rows_gather(
+                q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim),
+                layer.k.view(-1, attn.num_kv_heads, attn.head_dim),
+                layer.v.view(-1, attn.num_kv_heads, attn.head_dim),
+                indices, attn.sm_scale, seq,
+                block_table = block_table, page_size = layer.k.shape[1],
+            )
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):

@@ -12,6 +12,7 @@ from .gated_rmsnorm import GatedRMSNorm
 from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
+from .quant.exl3 import cpu_linear_forward_batch
 import os
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
@@ -29,8 +30,19 @@ _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" el
 _gate_dtype = torch.float if os.environ.get("EXL3_GDN_GATE_FP32", "1") != "0" else torch.half
 # Prefill conv reads the projection output in place (token-major) instead of a transposed bf16 copy
 _conv_token_major = os.environ.get("EXL3_GDN_CONV_TOKEN_MAJOR", "1") != "0"
+# EXL3_GDN_STEP=0 disables the fused CPU decode step (gdn_step_cpu), for A/B testing
+_gdn_step_enable = os.environ.get("EXL3_GDN_STEP", "1") != "0"
+# Worker count of the fused step's pool; 0 leaves the kernel's own default (1: waking parked
+# workers under the moe pool + system load measured far worse than the single-threaded sweep)
+_gdn_step_threads = int(os.environ.get("EXL3_GDN_STEP_CPU_THREADS", "0"))
 from ..model.model_tp_shared import TPTensorWrapper
-from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
+from .gated_delta_net_fn import (
+    causal_conv1d_update,
+    causal_conv1d_update_cpu,
+    gdn_fused_op_cpu,
+    gdn_fused_op_2_cpu,
+    gated_delta_rule_fn,
+)
 from ..cache.recurrent import (
     mp_cache_recurrent_stash,
     mp_cache_recurrent_unstash,
@@ -66,6 +78,10 @@ def _rewind_layers(layers, slot: int, last_history: int, num_tokens: int,
     replay_by_key = {}
     for l in layers:
         if isinstance(l, GDNLayerState):
+            if torch.device(l.device).type != "cuda":
+                # No batched rewind kernels off CUDA; the torch rewind is the same math
+                l.rewind(slot, last_history, num_tokens, spec_row, spec_shape, base_row, scratch_row)
+                continue
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
@@ -393,6 +409,52 @@ class GDNLayerState:
         m = self.module
         kind = 2 if getattr(m, "kda", False) else (1 if getattr(m, "mamba2", False) else 0)
         return kind, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim
+
+
+    def rewind(self, slot: int, last_history: int, num_tokens: int,
+               spec_row: int | None = None, spec_shape: tuple | None = None,
+               base_row: int = 0, scratch_row: int = 1):
+        """Non-CUDA twin of the batched rewind kernels (ext.batched_conv_rewind +
+        batched_scan_replay): the conv ring copies its recorded window back, and the accepted
+        prefix's state is rebuilt by replaying the staged scan inputs from the base row into
+        the scratch row through the CPU delta-rule scan"""
+        if last_history == 0:
+            return
+        assert 0 <= num_tokens <= last_history, \
+            f"GDN rewind: {num_tokens} tokens outside the recorded history of {last_history}"
+        if num_tokens > 0:
+            cs = self.conv_state
+            cdim = self.module.conv_kernel_size
+            p = cs.shape[-1] - num_tokens
+            cs[slot, :, :cdim].copy_(cs[slot, :, p - cdim : p])
+        if last_history > 0 and num_tokens > 0:
+            assert spec_shape is not None and spec_row is not None, \
+                "GDN rewind: history was recorded but the pass staged no scan inputs to replay"
+            prefix = last_history + 1 - num_tokens
+            bsz, seqlen, stride = spec_shape
+            rows = ([slot * seqlen + t for t in range(prefix)] if stride == 1
+                    else [t * bsz + slot for t in range(prefix)])
+            m = self.module
+            self.recurrent_state[scratch_row, 0].copy_(self.recurrent_state[base_row, 0])
+            g = self.spec_g[rows]
+            if getattr(m, "kda", False):
+                g = g.reshape(prefix, m.num_v_heads, m.k_head_dim)
+            from .gated_delta_net_fn import gated_delta_rule_fn
+            gated_delta_rule_fn(
+                mixed_qkv = self.spec_conv[rows].view(1, prefix, -1),
+                beta = self.spec_beta[rows].view(1, prefix, -1),
+                g = g.view(1, prefix, -1),
+                recurrent_state = self.recurrent_state,
+                recurrent_slots = torch.tensor([scratch_row], dtype = torch.long),
+                history = False,
+                save_state = True,
+                num_k_heads = m.num_k_heads,
+                num_v_heads = m.num_v_heads,
+                k_dim = m.k_dim,
+                v_dim = m.v_dim,
+                k_head_dim = m.k_head_dim,
+                v_head_dim = m.v_head_dim,
+            )
 
 
     def rewind_conv_job(self, slot: int, last_history: int, num_tokens: int):
@@ -749,6 +811,7 @@ class GatedDeltaNet(Module):
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
+        self._cpu_step = None
 
         self.recurrent_layers = []
         self.tp_recurrent_lookup = {}
@@ -783,6 +846,7 @@ class GatedDeltaNet(Module):
             rl.alloc(device)
 
         is_quantized = (
+            device != torch.device("cpu") and
             self.qkvz_proj is not None and self.qkvz_proj.quant_format_id() == "exl3" and
             self.ba_proj is not None and self.ba_proj.quant_format_id() is None and
             self.o_proj is not None and self.o_proj.quant_format_id() == "exl3"
@@ -989,6 +1053,7 @@ class GatedDeltaNet(Module):
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
+        self._cpu_step = None
         self.multi_qkvz = None
         self.prealloc_qkvz_carrier = None
         self.a_log = None
@@ -1004,6 +1069,40 @@ class GatedDeltaNet(Module):
             cl.free()
         super().unload()
 
+
+    def _gdn_step_statics(self):
+        """Weights of the middle section in the forms the fused CPU decode step reads (fp32
+        conv taps are laid out tap-major, the norm weight carries its constant bias). Built on
+        first use, None when the layer's projections don't fit the kernel's formats."""
+        s = getattr(self, "_cpu_step", None)
+        if s is not None:
+            return s
+        bp, ap = self.b_proj.inner, self.a_proj.inner
+        if (
+            bp.weight.dtype != torch.half or not bp.weight.is_contiguous() or
+            ap.weight.dtype != torch.half or not ap.weight.is_contiguous() or
+            self.conv1d_weight_flat is None or self.conv1d_weight_flat.dtype != torch.bfloat16 or
+            self.norm.groups != 1 or self.norm.out_dtype not in (None, torch.half)
+        ):
+            return None
+        device = self.device
+        nv, hv = self.num_v_heads, self.v_head_dim
+        bias_b = bp.get_bias_tensor()
+        bias_a = ap.get_bias_tensor()
+        self._cpu_step = s = {
+            "wb": bp.weight if bp.weight.is_contiguous() else bp.weight.contiguous(),
+            "bb": None if bias_b is None else bias_b.half().contiguous(),
+            "wa": ap.weight if ap.weight.is_contiguous() else ap.weight.contiguous(),
+            "ba": None if bias_a is None else bias_a.half().contiguous(),
+            "conv_w": self.conv1d_weight_flat.float().t().contiguous(),
+            "conv_b": None if self.conv1d_bias is None else self.conv1d_bias.float().contiguous(),
+            "dt_bias": self.dt_bias.float().contiguous(),
+            "a_log": self.a_log.float().contiguous(),
+            "norm_w": (self.norm.weight.float() + self.norm.constant_bias).contiguous(),
+            "gate_sigmoid": self.norm.gate_activation == "sigmoid",
+            "out": g_tensor_cache.get(device, (1, 1, nv * hv), torch.half, "gdn_step_out"),
+        }
+        return s
 
     def split_fused_inputs(self, mixed_qkvz, mixed_ba):
         # mixed_qkvz and mixed_ba have same (bsz, seqlen)
@@ -1283,20 +1382,37 @@ class GatedDeltaNet(Module):
             qkvz = self.qkvz_proj.forward(x, params)
             ba = self.ba_proj.forward(x, params)
 
-            mixed_qkv = torch.empty((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
-            z = torch.empty((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
+            if x.device.type == "cpu":
+                m_, z_, beta_, g_ = gdn_fused_op_cpu(
+                    qkvz, ba,
+                    self.dt_bias,
+                    self.a_log,
+                    self.num_k_heads,
+                    self.num_v_heads,
+                    self.k_head_dim,
+                    self.v_head_dim,
+                    self.beta_scale
+                )
+                mixed_qkv = m_
+                z = z_
+                beta = beta.copy_(beta_)
+                g = g.copy_(g_)
+                del m_, z_, beta_, g_
+            else:
+                mixed_qkv = torch.empty((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
+                z = torch.empty((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
 
-            ext.gated_delta_net_fused_op(
-                qkvz, ba,
-                self.dt_bias,
-                self.a_log,
-                mixed_qkv, z, beta, g,
-                self.num_k_heads,
-                self.num_v_heads,
-                self.k_head_dim,
-                self.v_head_dim,
-                self.beta_scale
-            )
+                ext.gated_delta_net_fused_op(
+                    qkvz, ba,
+                    self.dt_bias,
+                    self.a_log,
+                    mixed_qkv, z, beta, g,
+                    self.num_k_heads,
+                    self.num_v_heads,
+                    self.k_head_dim,
+                    self.v_head_dim,
+                    self.beta_scale
+                )
             del qkvz, ba
         elif self.kda:
             qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
@@ -1344,9 +1460,50 @@ class GatedDeltaNet(Module):
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
-                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
-                z = self.z_proj.forward(x, params)   # fp32: the gated norm takes a bf16 or fp32 gate
+                # One worker-pool round set for both same-input projections on the CPU kernels
+                qkv, z = cpu_linear_forward_batch(
+                    [self.qkv_proj, self.z_proj], x, params, [_proj_dtype, None]
+                )
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+
+            # Fused CPU decode step: b/a projections + beta/g gates + conv update + one-token
+            # delta-rule scan + gated norm in one call (torch paths below stay as the fallback
+            # and parity reference). Decode-shaped CPU passes only; prefill, history staging and
+            # KDA are untouched
+            if (
+                _gdn_step_enable and
+                x.device.type == "cpu" and
+                seqlen == 1 and
+                save_state and not save_history and
+                qkv.dtype == torch.half and x.dtype == torch.half and x.is_contiguous() and
+                hasattr(ext, "gdn_step_cpu") and ext.gdn_step_cpu_has_avx512()
+            ):
+                st = self._gdn_step_statics()
+                if st is not None:
+                    nv_hv = self.num_v_heads * self.v_head_dim
+                    # the shared static output carries the bsz = 1 decode call; batched decode
+                    # allocates per call (the kernel takes any bsz within the state pool)
+                    out = st["out"] if bsz == 1 else \
+                        torch.empty(bsz, 1, nv_hv, dtype = torch.half, device = x.device)
+                    ext.gdn_step_cpu(
+                        x, qkv, z,
+                        conv_state,
+                        st["conv_w"], st["conv_b"],
+                        st["wb"], st["bb"], st["wa"], st["ba"],
+                        st["dt_bias"], st["a_log"],
+                        recurrent_state,
+                        recurrent_slots, slots_scan,
+                        st["norm_w"], out,
+                        self.beta_scale, self.rms_norm_eps, 0.0,
+                        st["gate_sigmoid"], z.dtype == torch.half,
+                        _gdn_step_threads,
+                    )
+                    del qkv, z
+                    x = self.o_proj.forward(out, params)
+                    if self.tp_reduce:
+                        self.tp_collect(params["backend"], x)
+                    return to2(x, out_dtype, self.out_dtype)
+
             b = self.b_proj.forward(x, params)
             a = self.a_proj.forward(x, params)
 
@@ -1356,26 +1513,43 @@ class GatedDeltaNet(Module):
                 mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
             del qkv
 
-            ext.gated_delta_net_fused_op_2(
-                b, a,
-                self.dt_bias,
-                self.a_log,
-                beta, g,
-                self.beta_scale
-            )
+            if x.device.type == "cpu":
+                beta_, g_ = gdn_fused_op_2_cpu(b, a, self.dt_bias, self.a_log, self.beta_scale)
+                beta = beta.copy_(beta_)
+                g = g.copy_(g_)
+                del beta_, g_
+            else:
+                ext.gated_delta_net_fused_op_2(
+                    b, a,
+                    self.dt_bias,
+                    self.a_log,
+                    beta, g,
+                    self.beta_scale
+                )
 
         # Convolution
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv = mixed_qkv,
-            conv_state = conv_state,
-            recurrent_slots = recurrent_slots,
-            conv1d_weight = self.conv1d_weight_flat,
-            conv1d_bias = self.conv1d_bias,
-            history = save_history,
-            params = params,
-            token_major = conv_token_major,
-            incremental = bool(spec_step),
-        )
+        if mixed_qkv.device.type == "cpu":
+            mixed_qkv = causal_conv1d_update_cpu(
+                mixed_qkv,
+                conv_state,
+                recurrent_slots,
+                self.conv1d_weight_flat,
+                self.conv1d_bias,
+                save_history,
+                conv_token_major,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv = mixed_qkv,
+                conv_state = conv_state,
+                recurrent_slots = recurrent_slots,
+                conv1d_weight = self.conv1d_weight_flat,
+                conv1d_bias = self.conv1d_bias,
+                history = save_history,
+                params = params,
+                token_major = conv_token_major,
+                incremental = bool(spec_step),
+            )
         if save_history:
             mixed_qkv = staged_conv.copy_(mixed_qkv)
 

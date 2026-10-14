@@ -85,14 +85,41 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         return torch.cat(o, dim = 1)
 
 
-def _torch_bighead_fallback(
+def fn_torch_sdpa_cpu_paged(args: AttnArgs) -> torch.Tensor | None:
+    # CPU paged-cache attention (the QSA dense regime and every non-QSA cached layer on a
+    # CPU-only load): gather the sequence's pages into one contiguous buffer, append the new
+    # K/V rows in place and run chunked SDPA with the GQA broadcast. Declines everything else.
+    if (
+        args.q.device.type != "cpu" or
+        not args.has_kv_cache() or
+        args.q_cache is not None or
+        args.is_varlen() or
+        args.is_swa() or
+        args.window_right or
+        args.softcap != 0.0 or
+        args.sinks is not None or
+        args.non_causal_spans
+    ):
+        return None
+    if not args.causal:
+        return None
+    return _torch_paged_gather_sdpa(
+        args.q, args.k, args.v,
+        args.k_cache, args.v_cache,
+        args.block_table, args.cache_seqlens,
+        args.sm_scale,
+    )
+
+
+def _torch_paged_gather_sdpa(
     q, k, v,
     k_cache, v_cache,
     block_table, cache_seqlens,
-    causal = False, softmax_scale = None,
+    softmax_scale,
+    causal = True,
+    chunk_size = 512,
     window_size = None,
     softcap = None,
-    chunk_size = 512,
 ):
     batch, seqlen_q, nheads, headdim = q.shape
     _, seqlen_new, nheads_k, _ = k.shape
@@ -101,6 +128,7 @@ def _torch_bighead_fallback(
     turing = sdpa_prefill(q.device)
     if not turing:
         _warn_sdpa_fallback()
+
     outputs = []
     for b in range(batch):
         seq_len = cache_seqlens[b].item()
@@ -241,3 +269,20 @@ def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causa
         chunk_outputs.append(o.squeeze(0).transpose(0, 1))
 
     return torch.cat(chunk_outputs, dim = 0)
+
+
+
+def _torch_bighead_fallback(
+    q, k, v,
+    k_cache, v_cache,
+    block_table, cache_seqlens,
+    causal = False, softmax_scale = None,
+    window_size = None,
+    softcap = None,
+    chunk_size = 512,
+):
+    _warn_sdpa_fallback()
+    return _torch_paged_gather_sdpa(
+        q, k, v, k_cache, v_cache, block_table, cache_seqlens,
+        softmax_scale, causal, chunk_size,
+    )
