@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -15,7 +16,33 @@
 #ifdef __linux__
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
+#endif
+
+inline uint64_t hc_now_ns()
+{
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Process affinity as it stood when the extension loaded, before any pool pinned the caller
+// (see Pool::ensure). Function-local statics would capture a pinned mask; namespace-scope
+// dynamic init runs at dlopen on the loading (main, unpinned) thread
+#ifdef __linux__
+struct HcAffinity
+{
+    cpu_set_t set;
+    bool have;
+    HcAffinity()
+    {
+        CPU_ZERO(&set);
+        have = sched_getaffinity(0, sizeof(set), &set) == 0
+               && CPU_COUNT(&set) > 0;
+    }
+};
+static HcAffinity g_hc_worker_affinity;
 #endif
 
 // Fused GatedResidual hyper-connection mix on CPU (hc_mix_cpu.h). Structure mirrors the row
@@ -42,20 +69,14 @@ typedef void (*PoolFn)(void* ctx, int worker, int num_workers);
 // on cores the moe pool's pinned workers keep busy between hc calls. A pinned hc worker woken
 // under a busy moe worker waits out the CFS wakeup granularity (~ms, and evicts it), which
 // measured worse than running the whole mix single-threaded; a floating worker is placed on an
-// idle LP the moment it wakes.
+// idle LP the moment it wakes. Floating only works if the mask the workers inherit at spawn is
+// the full process set: Pool::ensure restores that mask (see HcAffinity), because the spawning
+// thread is by then the moe/linear pool's pinned worker 0 whenever a prefill moe kernel ran
+// first -- an inherited {core0} mask parks every hc worker and the master on one core and turns
+// each ~0.5 ms mix into a ~20 ms timeslice (13x decode stall, sticky for the process lifetime).
 
 struct Pool
 {
-    std::atomic<uint64_t> dispatch{0};
-    std::atomic<uint64_t> done{0};
-    std::atomic<PoolFn> fn{nullptr};
-    void* ctx = nullptr;
-    uint64_t generation = 0;
-    int spawned = 0;
-    int num_workers = 1;
-    static constexpr int DISPATCH_NW_BITS = 16;
-    static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
-
     void worker_loop(int idx)
     {
         uint64_t seen = 0;
@@ -94,20 +115,42 @@ struct Pool
     {
         while (spawned < n - 1)
         {
-            std::thread(&Pool::worker_loop, this, spawned + 1).detach();
+            std::thread t(&Pool::worker_loop, this, spawned + 1);
+#ifdef __linux__
+            // Workers are detached and reused for the life of the process, and inherit the
+            // spawning thread's affinity mask. By the first hc call that thread is usually the
+            // moe/linear pool's pinned worker 0 (any prefill that runs a moe kernel pins the
+            // caller to its core), so an inherited mask would confine every hc worker to that
+            // one core with the master -- the ~0.5 ms mix turns into a ~20 ms futex-wake
+            // timeslice (measured: 0.5 -> 7.1 tok/s decode, sticky for the process lifetime).
+            // Restore the process's original mask, captured at ext load before any pool pins
+            // anything; empty on failure means leave the inheritance alone.
+            if (g_hc_worker_affinity.have)
+                pthread_setaffinity_np(t.native_handle(), sizeof(cpu_set_t), &g_hc_worker_affinity.set);
+#endif
+            t.detach();
             ++spawned;
         }
+        if (n > num_workers) n_eff = n;   // first config or a raised env target: cap follows
         num_workers = n;
+        n_eff = std::min(n_eff, n);
+        static const bool adapt_v = [] {
+            const char* e = std::getenv("EXL3_HC_MIX_CPU_ADAPT");
+            return !(e && *e == '0');
+        }();
+        adapt_cap = adapt_v;
     }
 
     void run(PoolFn f, void* c, int n_req = 0)
     {
         int n = num_workers;
         if (n_req > 0 && n_req < n) n = n_req;
+        if (n > n_eff) n = n_eff;
         if (n <= 1) { f(c, 0, 1); return; }
         ctx = c;
         fn.store(f, std::memory_order_relaxed);
         const uint64_t d0 = done.load(std::memory_order_acquire);
+        const uint64_t t0 = hc_now_ns();
         ++generation;
         dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
 #ifdef __linux__
@@ -116,7 +159,29 @@ struct Pool
         f(c, 0, n);
         while (static_cast<int64_t>(done.load(std::memory_order_acquire) - d0) < n - 1)
             cpu_pause();
+        // One-way safety net against a pathologically slow pool: a healthy parked pool rejoins
+        // in <= ~1 ms (measured 0.44 - 0.5 ms at 6 workers here, <= ~1 ms under load) while a
+        // broken one (workers confined to one busy core, oversized pool against the scheduler)
+        // sits at tens of ms, where single-threading wins. Eight joins over 4 ms (a step's
+        // worth, counted after a 32-call spawn grace) cap the pool at one worker for the rest
+        // of the process; EXL3_HC_MIX_CPU_ADAPT=0 disables the cap
+        ++joins;
+        if (joins > 32 && hc_now_ns() - t0 > 4000000 && ++slow_joins >= 8 && adapt_cap) n_eff = 1;
     }
+
+    std::atomic<uint64_t> dispatch{0};
+    std::atomic<uint64_t> done{0};
+    std::atomic<PoolFn> fn{nullptr};
+    void* ctx = nullptr;
+    uint64_t generation = 0;
+    int spawned = 0;
+    int num_workers = 1;
+    int n_eff = 1;
+    uint64_t joins = 0;
+    int slow_joins = 0;
+    bool adapt_cap = true;
+    static constexpr int DISPATCH_NW_BITS = 16;
+    static int dispatch_nw(uint64_t d) { return (int) (d & ((1ull << DISPATCH_NW_BITS) - 1)); }
 };
 
 Pool g_pool;
