@@ -15,6 +15,7 @@
 #include "cpu/hc_mix_cpu.h"
 #include "cpu/gdn_step_cpu.h"
 #include "cpu/fused_sampler_cpu.h"
+#include "cpu/router_cpu.h"
 
 #include "ngram.cuh"
 #include "sam.h"
@@ -90,6 +91,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gdn_step_cpu", &gdn_step_cpu, "gdn_step_cpu",
           py::call_guard<py::gil_scoped_release>());
     m.def("gdn_step_cpu_has_avx512", &gdn_step_cpu_has_avx512, "gdn_step_cpu_has_avx512");
+
+    m.def("router_std_cpu", &router_std_cpu, "router_std_cpu",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("router_std_cpu_has_avx512", &router_std_cpu_has_avx512, "router_std_cpu_has_avx512");
 
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
 #ifndef _WIN32
