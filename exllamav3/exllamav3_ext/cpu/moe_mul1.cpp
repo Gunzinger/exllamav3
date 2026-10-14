@@ -122,6 +122,61 @@ inline float mul1_k_inv()
     return v;
 }
 
+// EXL3_MUL1_PRF="<hint>:<bytes>[:<lines>]": prefetch sweep knob for the band-8 swizzled
+// weight stream (the lm_head-class decode GEMV, C3). hint t0/t1/t2/nta, byte distance ahead
+// of the stream pointer, optional line count (default 2 = one iteration's consumption).
+// Unset = the tuned default (single T1 line one k-row step ahead). Prefetches only affect
+// timing, never arithmetic: every setting is bit-identical to the default.
+struct Mul1Prf { bool on; int hint; int bytes; int lines; };
+inline const Mul1Prf& mul1_prf()
+{
+    static const Mul1Prf c = []{
+        Mul1Prf r{false, _MM_HINT_T1, 0, 2};
+        if (const char* e = std::getenv("EXL3_MUL1_PRF"))
+        {
+            char hint[8] = {};
+            int bytes = 0, lines = 2;
+            const int n = std::sscanf(e, "%7[^:]:%d:%d", hint, &bytes, &lines);
+            if (n >= 2 && bytes >= 64 && lines >= 1 && lines <= 16)
+            {
+                if (!std::strcmp(hint, "t0")) r.hint = _MM_HINT_T0;
+                else if (!std::strcmp(hint, "t1")) r.hint = _MM_HINT_T1;
+                else if (!std::strcmp(hint, "t2")) r.hint = _MM_HINT_T2;
+                else if (!std::strcmp(hint, "nta")) r.hint = _MM_HINT_NTA;
+                else return r;
+                r.on = true;
+                r.bytes = bytes;
+                r.lines = lines;
+            }
+        }
+        return r;
+    }();
+    return c;
+}
+
+// The band kernels' swz band-8 stream prefetch (one shared implementation). _mm_prefetch's
+// hint must be a compile-time constant, so the knob dispatches over constant cases (the
+// switch sits on the knob-enabled side of the branch; the default path stays the single
+// tuned T1 one-step-ahead prefetch)
+inline void mul1_prf_swz(const uint16_t* packed, size_t pf_step)
+{
+    const Mul1Prf prf = mul1_prf();
+    if (!prf.on)
+    {
+        _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+        return;
+    }
+    const char* p = reinterpret_cast<const char*>(packed) + prf.bytes;
+    for (int l = 0; l < prf.lines; ++l)
+        switch (prf.hint)
+        {
+            case _MM_HINT_T0: _mm_prefetch(p + l * 64, _MM_HINT_T0); break;
+            case _MM_HINT_T2: _mm_prefetch(p + l * 64, _MM_HINT_T2); break;
+            case _MM_HINT_NTA: _mm_prefetch(p + l * 64, _MM_HINT_NTA); break;
+            default: _mm_prefetch(p + l * 64, _MM_HINT_T1); break;
+        }
+}
+
 // -------------------------------------------------------------------------------------------
 //   Format tables
 // -------------------------------------------------------------------------------------------
@@ -767,7 +822,7 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 // Whole-group band on the swizzled layout: the k-stream is sequential, one line
                 // one step ahead is enough and the HW prefetcher follows the run (wider/farther
                 // measured neutral on K4, 7960X)
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -961,7 +1016,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
                 : packed_row + b * packed_size;
             if (mat.swz && band == 8)
             {
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -1224,7 +1279,7 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 // Whole-group band on the swizzled layout: the k-stream is sequential, one line
                 // one step ahead is enough and the HW prefetcher follows the run (wider/farther
                 // measured neutral on K4, 7960X)
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -1312,7 +1367,7 @@ void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout
             {
                 // Whole-group band on the swizzled layout: the k-stream is sequential, one line
                 // one step ahead is enough and the HW prefetcher follows the ru
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
