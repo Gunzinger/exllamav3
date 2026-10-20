@@ -30,10 +30,13 @@ try:
 except Exception:
     _gr_mix_cpu = False
 
-# C1: bf16 CPU hc tables (gr_mix_cpu dispatches on the table dtype): halves the ~13 MB/call
-# table stream. Tables are cast lazily at the first CPU mix -- never at load, the deferred
-# loader must not see extra byte copies -- and cached per module. Default off until A/B
-_hc_bf16_tables = os.environ.get("EXL3_HC_BF16", "0") == "1"
+# C1/M1: bf16 CPU hc tables (gr_mix_cpu dispatches on the table dtype): halves the ~13 MB/call
+# table stream (1.19 -> 0.60 GiB/step at 97 sites). Tables are cast lazily at the first CPU
+# mix -- never at load, the deferred loader must not see extra byte copies -- and cached per
+# module. Default on since the M1 gate: parity <= 5.6e-4 vs the fp32 reference (test_hc_mix
+# test_parity_bf16_tables) and the 4.05bpw self-golden is token-exact 48/48 with zero top-1
+# logit drift; EXL3_HC_BF16=0 restores the fp16 tables
+_hc_bf16_tables = os.environ.get("EXL3_HC_BF16", "1") != "0"
 
 
 def hc_flush(params: dict):
