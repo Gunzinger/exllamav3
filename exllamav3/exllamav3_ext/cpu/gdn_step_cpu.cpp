@@ -148,6 +148,15 @@ inline int gdn_chunk_scan_threads()
     return v;
 }
 
+inline int gdn_chunk_scan_barriers()
+{
+    static const int v = [] {
+        const char* e = std::getenv("EXL3_GDN_CHUNK_SCAN_BARRIERS");
+        return (e && std::atoi(e) != 0) ? 1 : 0;
+    }();
+    return v;
+}
+
 // -------------------------------------------------------------------------------------------
 //   Primitives
 // -------------------------------------------------------------------------------------------
@@ -339,6 +348,7 @@ struct GdnCtx
     uint16_t* cao;                 // (rows, nv * dv) bf16, scan output
     float* wscr;                   // chunk-scan worker scratch, wscr_stride floats per worker
     size_t wscr_stride;
+    int barriers;                  // chunk pool: 1 = legacy two-barrier phase schedule
     int64_t conv_slot_stride;      // conv_state plane stride
     // dims / scalars
     int rows;                      // token rows: bsz (decode) or bsz * T (chunk scan)
@@ -362,13 +372,10 @@ static inline float softplus20(float x)
 // gates: b = x @ wb (+ bb), beta = bf16(sigmoid(b) * beta_scale); a = x @ wa (+ ba),
 // g = -softplus(a + dt_bias, thr 20) * exp(a_log)
 GDN_TARGET_AVX512
-static void gdn_gates_range(GdnCtx& c, int worker, int nw)
+static void gdn_gates_heads(GdnCtx& c, int j0, int j1)
 {
-    if (c.wb == nullptr || c.wa == nullptr) return;
+    if (c.wb == nullptr || c.wa == nullptr || j0 >= j1) return;
     const int nv = c.nv, hidden = c.hidden;
-    const int j0 = (int) ((int64_t) nv * worker / nw);
-    const int j1 = (int) ((int64_t) nv * (worker + 1) / nw);
-    if (j0 >= j1) return;
     alignas(64) float accb[512], acca[512];
     for (int j = j0; j < j1; ++j) { accb[j] = 0.0f; acca[j] = 0.0f; }
     for (int b = 0; b < c.rows; ++b)
@@ -404,6 +411,14 @@ static void gdn_gates_range(GdnCtx& c, int worker, int nw)
         // accumulators are shared across rows: re-zero for the next row
         for (int j = j0; j < j1; ++j) { accb[j] = 0.0f; acca[j] = 0.0f; }
     }
+}
+
+GDN_TARGET_AVX512
+static void gdn_gates_range(GdnCtx& c, int worker, int nw)
+{
+    const int j0 = (int) ((int64_t) c.nv * worker / nw);
+    const int j1 = (int) ((int64_t) c.nv * (worker + 1) / nw);
+    gdn_gates_heads(c, j0, j1);
 }
 
 // depthwise short conv over [state window | token] + SiLU into mixed; the state window shifts by
@@ -610,12 +625,10 @@ inline void gdn_l2norm_row(const uint16_t* p, float* o, int n)
 // (bf16-rounded) tokens, which is what causal_conv1d_update_cpu stores
 // (history = False, channel-major bf16 token pre-round as in gdn_conv_range)
 GDN_TARGET_AVX512
-static void gdn_conv_seq_range(GdnCtx& c, int worker, int nw)
+static void gdn_conv_seq_channels(GdnCtx& c, int c0, int c1)
 {
     const int K = c.kdim, fdim = c.fdim;
     TORCH_CHECK(K >= 1 && K <= 16, "gdn_chunk_scan_cpu: kdim <= 16 supported");
-    const int c0 = (int) ((int64_t) fdim * worker / nw);
-    const int c1 = (int) ((int64_t) fdim * (worker + 1) / nw);
     for (int b = 0; b < c.bsz; ++b)
     {
         uint16_t* cs = c.conv_state + (size_t) c.conv_slot[b] * c.conv_slot_stride;
@@ -681,6 +694,30 @@ static void gdn_conv_seq_range(GdnCtx& c, int worker, int nw)
     }
 }
 
+GDN_TARGET_AVX512
+static void gdn_conv_seq_range(GdnCtx& c, int worker, int nw)
+{
+    const int fdim = c.fdim;
+    gdn_conv_seq_channels(c, (int) ((int64_t) fdim * worker / nw),
+                          (int) ((int64_t) fdim * (worker + 1) / nw));
+}
+
+// the worker's own channels: the k/q blocks of its k-heads plus its v-heads' block, so every
+// mixed channel is produced by exactly one worker before that worker's scan reads it
+GDN_TARGET_AVX512
+static void gdn_conv_seq_parts(GdnCtx& c, int h0, int h1)
+{
+    const int group = c.nv / c.nk;
+    const int k0 = h0 / group, k1 = h1 / group;
+    const int qoff = c.nk * c.dk, voff = 2 * c.nk * c.dk;
+    if (k1 > k0)
+    {
+        gdn_conv_seq_channels(c, k0 * c.dk, k1 * c.dk);
+        gdn_conv_seq_channels(c, qoff + k0 * c.dk, qoff + k1 * c.dk);
+    }
+    gdn_conv_seq_channels(c, voff + h0 * c.dv, voff + h1 * c.dv);
+}
+
 // T-token grouped delta-rule scan, WY chunk form, mirroring torch_chunk_gated_delta_rule_cpu
 // (gated_delta_rule.py:85): within a chunk of n tokens, G = cumsum(g), D = G_i - G_j,
 // A = tril_strict((k_i . k_j) e^D beta_i), X = (I + A)^-1 by forward substitution (unit lower
@@ -692,16 +729,14 @@ static void gdn_conv_seq_range(GdnCtx& c, int worker, int nw)
 // the load) once at t = 0, written back (round RNE) once at t = T-1.
 template <bool SH>
 GDN_TARGET_AVX512
-static void gdn_chunk_scan_range(GdnCtx& c, int worker, int nw)
+static void gdn_chunk_scan_range(GdnCtx& c, int worker, int h0, int h1)
 {
     const int nv = c.nv, dk = c.dk, dv = c.dv, T = c.T, C = c.chunk;
     const int group = nv / c.nk;
     const float scale = 1.0f / std::sqrt((float) dk);
-    const int h0 = (int) ((int64_t) nv * worker / nw);
-    const int h1 = (int) ((int64_t) nv * (worker + 1) / nw);
     if (h0 >= h1) return;
     float* W = c.wscr + (size_t) worker * c.wscr_stride;
-    float* hloc = W; W += (size_t) dk * dv;
+    float* hloc_grp = W; W += (size_t) group * dk * dv;
     float* kn_ = W; W += (size_t) C * dk;
     float* qn_ = W; W += (size_t) C * dk;
     float* w_ = W; W += (size_t) C * dk;
@@ -727,24 +762,53 @@ static void gdn_chunk_scan_range(GdnCtx& c, int worker, int nw)
         uint16_t* sth;
         if constexpr (SH) sth = c.recurrent_state_h + (size_t) c.scan_slot[b] * c.state_row_stride;
         else st = c.recurrent_state + (size_t) c.scan_slot[b] * c.state_row_stride;
-        for (int i = h0; i < h1; ++i)
+        // one k-head group at a time: its q/k l2norm rows are filled once per chunk right
+        // before the group's heads consume them, and the heads' fp32 state lives in group
+        // scratch for the whole pass (fp32 slot round-trips between chunks are exact)
+        const int k0 = h0 / group, k1 = (h1 - 1) / group + 1;
+        for (int kh = k0; kh < k1; ++kh)
         {
-            const int kh = i / group;
-            const size_t soff = (size_t) i * dk * dv;
-            for (int e = 0; e < dk * dv; ++e)
-                hloc[e] = SH ? gdn_half_to_f32(sth[soff + e]) : st[soff + e];
+            const int i_lo = std::max(h0, kh * group);
+            const int i_hi = std::min(h1, kh * group + group);
+            if (i_lo >= i_hi) continue;
+            for (int i = i_lo; i < i_hi; ++i)
+            {
+                const size_t soff = (size_t) i * dk * dv;
+                float* hloc = hloc_grp + (size_t) (i - i_lo) * dk * dv;
+                if constexpr (SH)
+                {
+                    for (int e = 0; e + 16 <= dk * dv; e += 16)
+                        _mm512_storeu_ps(hloc + e, gdn_half_load16(sth + soff + e));
+                    for (int e = dk * dv & ~15; e < dk * dv; ++e)
+                        hloc[e] = gdn_half_to_f32(sth[soff + e]);
+                }
+                else
+                {
+                    for (int e = 0; e + 16 <= dk * dv; e += 16)
+                        _mm512_storeu_ps(hloc + e, _mm512_loadu_ps(st + soff + e));
+                    for (int e = dk * dv & ~15; e < dk * dv; ++e)
+                        hloc[e] = st[soff + e];
+                }
+            }
             for (int t0 = 0; t0 < T; t0 += C)
             {
                 const int n = std::min(C, T - t0);
                 for (int j = 0; j < n; ++j)
                 {
                     const int t = t0 + j;
-                    Gc[j] = (j ? Gc[j - 1] : 0.0f) + c.g[(size_t) (b * T + t) * nv + i];
-                    eG[j] = std::exp(Gc[j]);
-                    bc[j] = gdn_bf16_to_f32(c.beta[(size_t) (b * T + t) * nv + i]);
                     gdn_l2norm_row(kr + (size_t) t * c.fdim + (size_t) kh * dk, kn_ + (size_t) j * dk, dk);
                     gdn_l2norm_row(qr + (size_t) t * c.fdim + (size_t) kh * dk, qn_ + (size_t) j * dk, dk);
                 }
+                for (int i = i_lo; i < i_hi; ++i)
+                {
+                    float* hloc = hloc_grp + (size_t) (i - i_lo) * dk * dv;
+                    for (int j = 0; j < n; ++j)
+                    {
+                        const int t = t0 + j;
+                        Gc[j] = (j ? Gc[j - 1] : 0.0f) + c.g[(size_t) (b * T + t) * nv + i];
+                        eG[j] = std::exp(Gc[j]);
+                        bc[j] = gdn_bf16_to_f32(c.beta[(size_t) (b * T + t) * nv + i]);
+                    }
                 for (int a = 0; a < n; ++a)
                 {
                     const float* kna = kn_ + (size_t) a * dk;
@@ -766,41 +830,82 @@ static void gdn_chunk_scan_range(GdnCtx& c, int worker, int nw)
                 }
                 for (int a = 0; a < n; ++a)
                 {
+                    // xa[j] = -sum_{m=j..a-1} aa[a][m] xx[m][j]: accumulate across j in vector
+                    // lanes, m ascending so every lane's FMA chain matches the scalar order,
+                    // negate once at the store (same -0.0/+0.0 behavior as the scalar -s)
                     float* xa = xx + (size_t) a * n;
-                    xa[a] = 1.0f;
-                    for (int j = 0; j < a; ++j)
+                    const float* aaa = aa + (size_t) a * n;
+                    const int nb = (a + 15) >> 4;
+                    __m512 acc[4];
+                    for (int jb = 0; jb < nb; ++jb) acc[jb] = _mm512_setzero_ps();
+                    for (int m = 0; m < a; ++m)
                     {
-                        float s = 0.0f;
-                        for (int m = j; m < a; ++m)
-                            s = std::fma(aa[(size_t) a * n + m], xx[(size_t) m * n + j], s);
-                        xa[j] = -s;
+                        const __m512 av = _mm512_set1_ps(aaa[m]);
+                        const float* xm = xx + (size_t) m * n;
+                        int jb = 0;
+                        for (; jb < (m >> 4); ++jb)
+                            acc[jb] = _mm512_fmadd_ps(av, _mm512_loadu_ps(xm + (jb << 4)), acc[jb]);
+                        const __mmask16 km = (__mmask16) ((1u << ((m & 15) + 1)) - 1u);
+                        acc[jb] = _mm512_fmadd_ps(av, _mm512_maskz_loadu_ps(km, xm + (jb << 4)), acc[jb]);
                     }
+                    const __m512 sn = _mm512_set1_ps(-0.0f);
+                    int jb = 0;
+                    for (; (jb << 4) + 16 <= a; ++jb)
+                        _mm512_storeu_ps(xa + (jb << 4), _mm512_xor_ps(acc[jb], sn));
+                    if ((jb << 4) < a)
+                        _mm512_mask_storeu_ps(xa + (jb << 4),
+                                              (__mmask16) ((1u << (a - (jb << 4))) - 1u),
+                                              _mm512_xor_ps(acc[jb], sn));
+                    xa[a] = 1.0f;
                 }
                 for (int a = 0; a < n; ++a)
                 {
+                    // wa/ua accumulate in zmm registers (8 lanes-wide tiles of 128 elements,
+                    // j ascending per element = the original order), one store per tile
                     float* wa = w_ + (size_t) a * dk;
                     float* ua = u_ + (size_t) a * dv;
                     for (int d = 0; d < dk; ++d) wa[d] = 0.0f;
                     for (int v = 0; v < dv; ++v) ua[v] = 0.0f;
                     const float* xa = xx + (size_t) a * n;
-                    for (int j = 0; j <= a; ++j)
+                    for (int d0 = 0; d0 < dk; d0 += 128)
                     {
-                        const float bge = xa[j] * (bc[j] * eG[j]);
-                        const float xbj = xa[j] * bc[j];
-                        const float* knj = kn_ + (size_t) j * dk;
-                        const uint16_t* vp = vr + (size_t) (t0 + j) * c.fdim + (size_t) i * dv;
-                        const __m512 bgev = _mm512_set1_ps(bge);
-                        const __m512 xbjv = _mm512_set1_ps(xbj);
-                        int d = 0;
-                        for (; d + 16 <= dk; d += 16)
-                            _mm512_storeu_ps(wa + d, _mm512_fmadd_ps(bgev, _mm512_loadu_ps(knj + d),
-                                                                     _mm512_loadu_ps(wa + d)));
-                        for (; d < dk; ++d) wa[d] = std::fma(bge, knj[d], wa[d]);
-                        int v = 0;
-                        for (; v + 16 <= dv; v += 16)
-                            _mm512_storeu_ps(ua + v, _mm512_fmadd_ps(xbjv, gdn_bf16_load(vp + v),
-                                                                     _mm512_loadu_ps(ua + v)));
-                        for (; v < dv; ++v) ua[v] = std::fma(xbj, gdn_bf16_to_f32(vp[v]), ua[v]);
+                        const int d1 = std::min(dk, d0 + 128);
+                        const int fb = (d1 - d0) >> 4;
+                        __m512 acc[8];
+                        for (int bl = 0; bl < fb; ++bl) acc[bl] = _mm512_setzero_ps();
+                        for (int j = 0; j <= a; ++j)
+                        {
+                            const float bge = xa[j] * (bc[j] * eG[j]);
+                            const __m512 bgev = _mm512_set1_ps(bge);
+                            const float* knj = kn_ + (size_t) j * dk + d0;
+                            int bl = 0;
+                            for (; bl < fb; ++bl)
+                                acc[bl] = _mm512_fmadd_ps(bgev, _mm512_loadu_ps(knj + (bl << 4)), acc[bl]);
+                            for (int d = d0 + (fb << 4); d < d1; ++d)
+                                wa[d] = std::fma(bge, knj[d - d0], wa[d]);
+                        }
+                        for (int bl = 0; bl < fb; ++bl)
+                            _mm512_storeu_ps(wa + d0 + (bl << 4), acc[bl]);
+                    }
+                    for (int v0 = 0; v0 < dv; v0 += 128)
+                    {
+                        const int v1 = std::min(dv, v0 + 128);
+                        const int fb = (v1 - v0) >> 4;
+                        __m512 acc[8];
+                        for (int bl = 0; bl < fb; ++bl) acc[bl] = _mm512_setzero_ps();
+                        for (int j = 0; j <= a; ++j)
+                        {
+                            const float xbj = xa[j] * bc[j];
+                            const __m512 xbjv = _mm512_set1_ps(xbj);
+                            const uint16_t* vp = vr + (size_t) (t0 + j) * c.fdim + (size_t) i * dv + v0;
+                            int bl = 0;
+                            for (; bl < fb; ++bl)
+                                acc[bl] = _mm512_fmadd_ps(xbjv, gdn_bf16_load(vp + (bl << 4)), acc[bl]);
+                            for (int v = v0 + (fb << 4); v < v1; ++v)
+                                ua[v] = std::fma(xbj, gdn_bf16_to_f32(vp[v - v0]), ua[v]);
+                        }
+                        for (int bl = 0; bl < fb; ++bl)
+                            _mm512_storeu_ps(ua + v0 + (bl << 4), acc[bl]);
                     }
                 }
                 for (int a = 0; a < n; ++a)
@@ -901,56 +1006,79 @@ static void gdn_chunk_scan_range(GdnCtx& c, int worker, int nw)
                             hloc[(size_t) d * dv + v] = std::fma(kna[d], va[v], hloc[(size_t) d * dv + v]);
                     }
                 }
-            }
-            for (int e = 0; e < dk * dv; ++e)
-            {
-                if constexpr (SH) sth[soff + e] = gdn_f32_to_half(hloc[e]);
-                else st[soff + e] = hloc[e];
+                if (t0 + n == T)
+                {
+                    const size_t soff = (size_t) i * dk * dv;
+                    if constexpr (SH)
+                    {
+                        for (int e = 0; e + 16 <= dk * dv; e += 16)
+                            gdn_half_store((at::Half*) (sth + soff + e), _mm512_loadu_ps(hloc + e));
+                        for (int e = dk * dv & ~15; e < dk * dv; ++e)
+                            sth[soff + e] = gdn_f32_to_half(hloc[e]);
+                    }
+                    else
+                    {
+                        for (int e = 0; e + 16 <= dk * dv; e += 16)
+                            _mm512_storeu_ps(st + soff + e, _mm512_loadu_ps(hloc + e));
+                        for (int e = dk * dv & ~15; e < dk * dv; ++e)
+                            st[soff + e] = hloc[e];
+                    }
+                }
             }
         }
+    }
     }
 }
 
 // gated RMS norm over the scan output: h = bf16(scan out) -> f32, * rsqrt(mean h^2 + eps),
 // * (weight + bias), * gate(z), -> fp16 (GatedRMSNorm._forward_cpu, not gate_first)
 GDN_TARGET_AVX512
-static void gdn_norm_range(GdnCtx& c, int worker, int nw)
+static void gdn_norm_row(GdnCtx& c, int r)
 {
     const int nv = c.nv, dv = c.dv;
-    const int rows = c.rows * nv;
-    const int r0 = (int) ((int64_t) rows * worker / nw);
-    const int r1 = (int) ((int64_t) rows * (worker + 1) / nw);
-    if (r0 >= r1) return;
     const __m512 eps = _mm512_set1_ps(c.rms_eps);
     const __m512 bias = _mm512_set1_ps(c.norm_bias);
-    for (int r = r0; r < r1; ++r)
+    const int b = r / nv;
+    const int i = r - b * nv;
+    const uint16_t* hp = c.cao + (size_t) r * dv;
+    const float rmf = 1.0f / std::sqrt(gdn_sumsq_hp(hp, dv) / (float) dv + c.rms_eps);
+    const float* zp32 = c.z32 ? c.z32 + (size_t) r * dv : nullptr;
+    const uint16_t* zp16 = c.z16 ? c.z16 + (size_t) r * dv : nullptr;
+    at::Half* op = c.out + (size_t) r * dv;
+    int d = 0;
+    for (; d + 16 <= dv; d += 16)
     {
-        const int b = r / nv;
-        const int i = r - b * nv;
-        const uint16_t* hp = c.cao + (size_t) r * dv;
-        const float rmf = 1.0f / std::sqrt(gdn_sumsq_hp(hp, dv) / (float) dv + c.rms_eps);
-        const float* zp32 = c.z32 ? c.z32 + (size_t) r * dv : nullptr;
-        const uint16_t* zp16 = c.z16 ? c.z16 + (size_t) r * dv : nullptr;
-        at::Half* op = c.out + (size_t) r * dv;
-        int d = 0;
-        for (; d + 16 <= dv; d += 16)
-        {
-            __m512 hv = gdn_bf16_load(hp + d);
-            hv = _mm512_mul_ps(hv, _mm512_set1_ps(rmf));
-            hv = _mm512_mul_ps(hv, _mm512_add_ps(_mm512_loadu_ps(c.norm_w + d), bias));
-            __m512 gv = c.z32 ? _mm512_loadu_ps(zp32 + d)
-                              : _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) (zp16 + d)));
-            __m512 gated = c.gate_sigmoid ? gdn_sigmoid512(gv) : gdn_silu512(gv);
-            gdn_half_store(op + d, _mm512_mul_ps(hv, gated));
-        }
-        for (; d < dv; ++d)
-        {
-            float v = gdn_bf16_to_f32(hp[d]) * rmf * (c.norm_w[d] + c.norm_bias);
-            float gv = c.z32 ? zp32[d] : _cvtsh_ss(zp16[d]);
-            float gate = c.gate_sigmoid ? gdn_sigmoid1(gv) : gdn_silu1(gv);
-            op[d] = at::Half(v * gate);
-        }
+        __m512 hv = gdn_bf16_load(hp + d);
+        hv = _mm512_mul_ps(hv, _mm512_set1_ps(rmf));
+        hv = _mm512_mul_ps(hv, _mm512_add_ps(_mm512_loadu_ps(c.norm_w + d), bias));
+        __m512 gv = c.z32 ? _mm512_loadu_ps(zp32 + d)
+                          : _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) (zp16 + d)));
+        __m512 gated = c.gate_sigmoid ? gdn_sigmoid512(gv) : gdn_silu512(gv);
+        gdn_half_store(op + d, _mm512_mul_ps(hv, gated));
     }
+    for (; d < dv; ++d)
+    {
+        float v = gdn_bf16_to_f32(hp[d]) * rmf * (c.norm_w[d] + c.norm_bias);
+        float gv = c.z32 ? zp32[d] : _cvtsh_ss(zp16[d]);
+        float gate = c.gate_sigmoid ? gdn_sigmoid1(gv) : gdn_silu1(gv);
+        op[d] = at::Half(v * gate);
+    }
+}
+
+GDN_TARGET_AVX512
+static void gdn_norm_range(GdnCtx& c, int worker, int nw)
+{
+    const int rows = c.rows * c.nv;
+    const int r0 = (int) ((int64_t) rows * worker / nw);
+    const int r1 = (int) ((int64_t) rows * (worker + 1) / nw);
+    for (int r = r0; r < r1; ++r) gdn_norm_row(c, r);
+}
+
+static void gdn_norm_heads(GdnCtx& c, int h0, int h1)
+{
+    for (int tr = 0; tr < c.rows; ++tr)
+        for (int i = h0; i < h1; ++i)
+            gdn_norm_row(c, tr * c.nv + i);
 }
 
 static void gdn_pool_fn(void* vctx, int worker, int nw)
@@ -967,19 +1095,47 @@ static void gdn_pool_fn(void* vctx, int worker, int nw)
     gdn_norm_range(c, worker, nw);
 }
 
-// gates | conv, then the chunk scan (q/k l2norm in-chunk), then the norm epilogue
+// k-head-group partition: each worker owns whole k-head groups, so its v-heads' gate/norm
+// work, its k-heads' conv channel blocks and its scan rows all pair up with no cross-worker
+// dependency (v-heads of one k-head never span workers)
+static inline void gdn_chunk_head_range(const GdnCtx& c, int worker, int nw, int& h0, int& h1)
+{
+    const int group = c.nv / c.nk;
+    const int k0 = (int) ((int64_t) c.nk * worker / nw);
+    const int k1 = (int) ((int64_t) c.nk * (worker + 1) / nw);
+    h0 = k0 * group;
+    h1 = k1 * group;
+}
+
+// gates | conv, then the chunk scan (q/k l2norm in-chunk), then the norm epilogue;
+// default head-partitioned barrier-free, EXL3_GDN_CHUNK_SCAN_BARRIERS=1 restores the
+// two-barrier phase schedule with the plain head/channel partitions
 static void gdn_chunk_pool_fn(void* vctx, int worker, int nw)
 {
     GdnCtx& c = *static_cast<GdnCtx*>(vctx);
-    gdn_gates_range(c, worker, nw);
-    gdn_conv_seq_range(c, worker, nw);
-    c.bar1.fetch_add(1, std::memory_order_acq_rel);
-    while (c.bar1.load(std::memory_order_acquire) < nw) gdn_pause();
-    if (c.state_half) gdn_chunk_scan_range<true>(c, worker, nw);
-    else gdn_chunk_scan_range<false>(c, worker, nw);
-    c.bar2.fetch_add(1, std::memory_order_acq_rel);
-    while (c.bar2.load(std::memory_order_acquire) < nw) gdn_pause();
-    gdn_norm_range(c, worker, nw);
+    if (c.barriers)
+    {
+        gdn_gates_range(c, worker, nw);
+        gdn_conv_seq_range(c, worker, nw);
+        c.bar1.fetch_add(1, std::memory_order_acq_rel);
+        while (c.bar1.load(std::memory_order_acquire) < nw) gdn_pause();
+        const int h0 = (int) ((int64_t) c.nv * worker / nw);
+        const int h1 = (int) ((int64_t) c.nv * (worker + 1) / nw);
+        if (c.state_half) gdn_chunk_scan_range<true>(c, worker, h0, h1);
+        else gdn_chunk_scan_range<false>(c, worker, h0, h1);
+        c.bar2.fetch_add(1, std::memory_order_acq_rel);
+        while (c.bar2.load(std::memory_order_acquire) < nw) gdn_pause();
+        gdn_norm_range(c, worker, nw);
+        return;
+    }
+    int h0, h1;
+    gdn_chunk_head_range(c, worker, nw, h0, h1);
+    if (h0 >= h1) return;
+    gdn_gates_heads(c, h0, h1);
+    gdn_conv_seq_parts(c, h0, h1);
+    if (c.state_half) gdn_chunk_scan_range<true>(c, worker, h0, h1);
+    else gdn_chunk_scan_range<false>(c, worker, h0, h1);
+    gdn_norm_heads(c, h0, h1);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1158,6 +1314,7 @@ void gdn_step_cpu
 }
 
 constexpr int GDN_SCAN_CHUNK = 64;   // the torch chunk reference's default chunk_size
+static_assert(GDN_SCAN_CHUNK <= 64); // forward substitution keeps 4 vector accumulators per row
 
 void gdn_chunk_scan_cpu
 (
@@ -1246,17 +1403,22 @@ void gdn_chunk_scan_cpu
 
     const int rows = bsz * T;
     const int C = GDN_SCAN_CHUNK;
+    int nk = -1;
+    for (int t = 1; t <= nv; ++t)
+        if (2 * t * dk + nv * dv == fdim) { nk = t; break; }
+    TORCH_CHECK(nk > 0, "gdn_chunk_scan_cpu: fdim does not decompose as 2 * nk * dk + nv * dv");
+    int nw = num_threads > 0 ? std::min(num_threads, gdn_chunk_scan_threads()) : gdn_chunk_scan_threads();
+    nw = std::max(1, nw);
+    const int group = nv / nk;
+    const size_t wscr_stride = (size_t) group * dk * dv + (size_t) 3 * C * dk +
+                               (size_t) 4 * C * dv + (size_t) 5 * C * C + (size_t) 3 * C;
+    at::Tensor wscr = at::empty({(int64_t) nw * wscr_stride}, qkv.options().dtype(at::kFloat));
+
     auto bf16opts = qkv.options().dtype(at::kBFloat16);
     at::Tensor mixed = at::empty({rows, fdim}, bf16opts);
     at::Tensor beta = at::empty({rows, nv}, bf16opts);
     at::Tensor g = at::empty({rows, nv}, qkv.options().dtype(at::kFloat));
     at::Tensor cao = at::empty({(int64_t) rows * nv * dv}, bf16opts);
-
-    int nw = num_threads > 0 ? std::min(num_threads, gdn_chunk_scan_threads()) : gdn_chunk_scan_threads();
-    nw = std::max(1, nw);
-    const size_t wscr_stride = (size_t) dk * dv + (size_t) 3 * C * dk + (size_t) 4 * C * dv +
-                               (size_t) 5 * C * C + (size_t) 3 * C;
-    at::Tensor wscr = at::empty({(int64_t) nw * wscr_stride}, qkv.options().dtype(at::kFloat));
 
     GdnCtx c;
     c.x = reinterpret_cast<const uint16_t*>(x.data_ptr<at::Half>());
@@ -1286,6 +1448,7 @@ void gdn_chunk_scan_cpu
     c.cao = reinterpret_cast<uint16_t*>(cao.data_ptr<at::BFloat16>());
     c.wscr = wscr.data_ptr<float>();
     c.wscr_stride = wscr_stride;
+    c.barriers = gdn_chunk_scan_barriers();
     c.bsz = bsz;
     c.rows = rows;
     c.T = T;
@@ -1294,13 +1457,9 @@ void gdn_chunk_scan_cpu
     c.fdim = fdim;
     c.kdim = kdim;
     c.nv = nv;
+    c.nk = nk;
     c.dk = dk;
     c.dv = dv;
-    int nk = -1;
-    for (int t = 1; t <= nv; ++t)
-        if (2 * t * dk + nv * dv == fdim) { nk = t; break; }
-    TORCH_CHECK(nk > 0, "gdn_chunk_scan_cpu: fdim does not decompose as 2 * nk * dk + nv * dv");
-    c.nk = nk;
     c.beta_scale = (float) beta_scale;
     c.rms_eps = (float) rms_eps;
     c.norm_bias = (float) norm_bias_add;
