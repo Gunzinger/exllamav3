@@ -203,6 +203,20 @@ inline int hc_cpu_threads()
     return v;
 }
 
+// Software prefetch distance (64-B lines) for the streamed fp16 tables in gr_dot_w/gr_dot_t;
+// 0 (default) issues none and compiles to the previous code. Memory hint only: results are
+// bit-identical at any value
+inline int hc_prf_dist()
+{
+    static const int v = [] {
+        int d = 0;
+        const char* e = std::getenv("EXL3_HC_PRF_DIST");
+        if (e) d = std::atoi(e);
+        return d > 0 ? d : 0;
+    }();
+    return v;
+}
+
 // -------------------------------------------------------------------------------------------
 //   Kernels
 // -------------------------------------------------------------------------------------------
@@ -239,14 +253,17 @@ inline __m512 gr_cvt16_ps(const __m256i v)
     return _mm512_cvtph_ps(v);
 }
 
-// dots[j, h] = <streams * w, fn[j, h]> over one stream row
-template <bool BF16>
+// dots[j, h] = <streams * w, fn[j, h]> over one stream row; PF streams the fp16 table
+// hc_prf_dist() 64-B lines ahead (hint only, results identical)
+template <bool BF16, bool PF>
 HC_TARGET_AVX512
 inline float gr_dot_w(const float* s, const float* w, const uint16_t* f, int D)
 {
     __m512 acc = _mm512_setzero_ps();
+    const int pf = hc_prf_dist() * 32;      // uint16 elements per 64-B line
     for (int d = 0; d < D; d += 16)
     {
+        if (PF) _mm_prefetch((const char*) (f + d + pf), _MM_HINT_T0);
         __m512 sv = _mm512_loadu_ps(s + d);
         __m512 wv = _mm512_loadu_ps(w + d);
         __m512 fv = gr_cvt16_ps<BF16>(_mm256_loadu_si256((const __m256i*) (f + d)));
@@ -264,19 +281,23 @@ inline float gr_sumsq(const float* s, int D)
     return _mm512_reduce_add_ps(acc);
 }
 
-// <t, up row> over one low rank
-template <bool BF16>
+// <t, up row> over one low rank; PF as in gr_dot_w
+template <bool BF16, bool PF>
 HC_TARGET_AVX512
 inline float gr_dot_t(const float* t, const uint16_t* u, int LR)
 {
     __m512 acc = _mm512_setzero_ps();
+    const int pf = hc_prf_dist() * 32;
     for (int i = 0; i < LR; i += 16)
+    {
+        if (PF) _mm_prefetch((const char*) (u + i + pf), _MM_HINT_T0);
         acc = _mm512_fmadd_ps(_mm512_loadu_ps(t + i),
                               gr_cvt16_ps<BF16>(_mm256_loadu_si256((const __m256i*) (u + i))), acc);
+    }
     return _mm512_reduce_add_ps(acc);
 }
 
-template <bool BF16>
+template <bool BF16, bool PF>
 static void gr_dots_range(const GrCtx& c, int i0, int i1)
 {
     const int mh = c.M + 1;
@@ -289,9 +310,9 @@ static void gr_dots_range(const GrCtx& c, int i0, int i1)
         {
             const uint16_t* frow = c.fn + (size_t) j * (c.H * c.D);
             for (int h = 0; h < c.H; ++h)
-                out[h] = gr_dot_w<BF16>(c.streams + ((size_t) r * c.H + h) * c.D,
-                                        c.w + (size_t) h * c.D,
-                                        frow + (size_t) h * c.D, c.D);
+                out[h] = gr_dot_w<BF16, PF>(c.streams + ((size_t) r * c.H + h) * c.D,
+                                            c.w + (size_t) h * c.D,
+                                            frow + (size_t) h * c.D, c.D);
         }
         else
         {
@@ -301,7 +322,7 @@ static void gr_dots_range(const GrCtx& c, int i0, int i1)
     }
 }
 
-template <bool BF16>
+template <bool BF16, bool PF>
 static void gr_finalize_range(const GrCtx& c, int worker, int d0, int d1, float inv_h)
 {
     const int H = c.H, D = c.D, LR = c.LR, R = c.R;
@@ -343,7 +364,7 @@ static void gr_finalize_range(const GrCtx& c, int worker, int d0, int d1, float 
             const float wd = c.w[(size_t) h * D + d];
             for (int r = 0; r < R; ++r)
             {
-                const float g = gr_dot_t<BF16>(c.t + (size_t) r * LR, u, LR);
+                const float g = gr_dot_t<BF16, PF>(c.t + (size_t) r * LR, u, LR);
                 o[r] += gr_sigmoid(g) * rmr[r * H + h] * inv_h * wd
                         * c.streams[((size_t) r * H + h) * D + d];
             }
@@ -353,18 +374,18 @@ static void gr_finalize_range(const GrCtx& c, int worker, int d0, int d1, float 
     }
 }
 
-template <bool BF16>
+template <bool BF16, bool PF>
 static void gr_pool_fn(void* vctx, int worker, int nw)
 {
     GrCtx& c = *static_cast<GrCtx*>(vctx);
     const int total_a = c.R * (c.M + 1);
-    gr_dots_range<BF16>(c, (int) ((int64_t) total_a * worker / nw),
-                     (int) ((int64_t) total_a * (worker + 1) / nw));
+    gr_dots_range<BF16, PF>(c, (int) ((int64_t) total_a * worker / nw),
+                      (int) ((int64_t) total_a * (worker + 1) / nw));
     c.bar.fetch_add(1, std::memory_order_acq_rel);
     while (c.bar.load(std::memory_order_acquire) < nw)
         cpu_pause();
     const int D = c.D;
-    gr_finalize_range<BF16>(c, worker,
+    gr_finalize_range<BF16, PF>(c, worker,
                             (int) ((int64_t) D * worker / nw),
                             (int) ((int64_t) D * (worker + 1) / nw),
                             1.0f / (float) c.H);
@@ -446,7 +467,76 @@ void gr_mix_cpu
     std::lock_guard<std::mutex> lock(g_pool_mutex);
     g_pool.ensure(nw);
     c.bar.store(0, std::memory_order_relaxed);
-    g_pool.run(bf16 ? &gr_pool_fn<true> : &gr_pool_fn<false>, &c, nw);
+    const bool pfd = hc_prf_dist() > 0;
+    g_pool.run(bf16 ? (pfd ? &gr_pool_fn<true, true> : &gr_pool_fn<true, false>)
+                    : (pfd ? &gr_pool_fn<false, true> : &gr_pool_fn<false, false>), &c, nw);
+}
+
+// -------------------------------------------------------------------------------------------
+//   apply_ (site residual update): x[r, h, d] += post[r, h] * y[r, d], in place
+// -------------------------------------------------------------------------------------------
+
+// The torch line's exact schedule: fp32 product (separate mul -- the empty asm blocks the
+// compiler's fmul+fadd -> FMA contraction, which the two torch kernels do not apply), fp32 add,
+// fp16 x stores round-to-nearest-even (fp32 x stores fp32: the trunk stream stack vs the MTP
+// draft's flattened half stack). Bit-equal by construction on both x dtypes
+template <bool X16>
+HC_TARGET_AVX512
+static void hc_apply_kernel(void* xv, const float* post, const uint16_t* y, int R, int H, int D)
+{
+    const size_t xsz = X16 ? 2 : 4;
+    for (int r = 0; r < R; ++r)
+    {
+        char* xr = (char*) xv + (size_t) r * H * D * xsz;
+        const float* pr = post + (size_t) r * H;
+        const uint16_t* yr = y + (size_t) r * D;
+        for (int d = 0; d < D; d += 16)
+        {
+            const __m512 yv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) (yr + d)));
+            for (int h = 0; h < H; ++h)
+            {
+                void* xp = xr + ((size_t) h * D + d) * xsz;
+                const __m512 acc = X16 ? _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) xp))
+                                       : _mm512_loadu_ps((const float*) xp);
+                __m512 prod = _mm512_mul_ps(_mm512_set1_ps(pr[h]), yv);
+                __asm__ volatile("" : "+v"(prod));
+                const __m512 sum = _mm512_add_ps(acc, prod);
+                if (X16)
+                    _mm256_storeu_si256((__m256i*) xp,
+                        _mm512_cvtps_ph(sum, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                else
+                    _mm512_storeu_ps((float*) xp, sum);
+            }
+        }
+    }
+}
+
+void hc_apply_cpu(at::Tensor& x, const at::Tensor& post, const at::Tensor& y)
+{
+    TORCH_CHECK(gr_mix_cpu_has_avx512(), "hc_apply_cpu: AVX-512 not available");
+    TORCH_CHECK(x.device().is_cpu() && post.device().is_cpu() && y.device().is_cpu(),
+                "hc_apply_cpu: tensors must be on CPU");
+    const bool x16 = x.scalar_type() == at::kHalf;
+    TORCH_CHECK(x16 || x.scalar_type() == at::kFloat, "hc_apply_cpu: x must be half or float");
+    TORCH_CHECK(x.is_contiguous() && x.dim() == 3, "hc_apply_cpu: x must be contiguous (R, H, D)");
+    TORCH_CHECK(post.scalar_type() == at::kFloat && post.is_contiguous() && post.dim() == 2,
+                "hc_apply_cpu: post must be contiguous CPU float (R, H)");
+    TORCH_CHECK(y.scalar_type() == at::kHalf && y.is_contiguous() && y.dim() == 2,
+                "hc_apply_cpu: y must be contiguous CPU half (R, D)");
+    const int R = post.size(0);
+    const int H = post.size(1);
+    const int D = y.size(1);
+    TORCH_CHECK(H == 4, "hc_apply_cpu: H = 4 only");
+    TORCH_CHECK(R >= 1 && R <= GR_MAX_R, "hc_apply_cpu: R in [1, 8]");
+    TORCH_CHECK(D % 16 == 0, "hc_apply_cpu: D must be a multiple of 16");
+    TORCH_CHECK(x.size(0) == R && x.size(1) == H && x.size(2) == D && y.size(0) == R,
+                "hc_apply_cpu: dims");
+    if (x16)
+        hc_apply_kernel<true>(x.data_ptr(), post.data_ptr<float>(),
+                              reinterpret_cast<const uint16_t*>(y.const_data_ptr()), R, H, D);
+    else
+        hc_apply_kernel<false>(x.data_ptr(), post.data_ptr<float>(),
+                               reinterpret_cast<const uint16_t*>(y.const_data_ptr()), R, H, D);
 }
 
 #else  // !x86
@@ -470,5 +560,10 @@ void gr_mix_cpu
 bool gr_mix_cpu_has_avx512()
 {
     return false;
+}
+
+void hc_apply_cpu(at::Tensor&, const at::Tensor&, const at::Tensor&)
+{
+    TORCH_CHECK(false, "hc_apply_cpu is not available on this CPU architecture (x86 AVX-512 only)");
 }
 #endif

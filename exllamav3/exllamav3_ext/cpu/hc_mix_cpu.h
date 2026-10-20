@@ -46,3 +46,18 @@ void gr_mix_cpu
 
 // True when the AVX-512 tier this kernel needs is present at runtime.
 bool gr_mix_cpu_has_avx512();
+
+// GatedResidual site residual update (apply_'s CPU branch) in one dispatch, in place, per element
+//   x[r, h, d] += post[r, h] * y[r, d]
+// with the torch line's exact rounding schedule: the product rounds to fp32 (separate mul and
+// add, no FMA contraction), the add rounds in x's width, and fp16 x stores round-to-nearest-even
+// (fp32 x -- the trunk's stream stack -- stores fp32; fp16 x is the MTP draft's flattened stack).
+// Bit-equal to the torch line by construction on both x dtypes. Single-threaded, no pool (the
+// rows are tiny; the point is one dispatch instead of five torch ops). Same AVX-512 tier as
+// gr_mix_cpu (gr_mix_cpu_has_avx512); callers gate on it plus the shape/dtype/contiguity
+// requirements and fall back to the torch line otherwise, which every failed check here also
+// forces via TORCH_CHECK.
+//   x:    (R, H, D) half or float, CPU, contiguous, updated in place
+//   post: (R, H) float, CPU, contiguous
+//   y:    (R, D) half, CPU, contiguous; H = 4, R in [1, 8], D % 16 == 0
+void hc_apply_cpu(at::Tensor& x, const at::Tensor& post, const at::Tensor& y);

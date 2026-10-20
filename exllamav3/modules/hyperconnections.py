@@ -38,6 +38,11 @@ except Exception:
 # logit drift; EXL3_HC_BF16=0 restores the fp16 tables
 _hc_bf16_tables = os.environ.get("EXL3_HC_BF16", "1") != "0"
 
+# T2: the site residual update (apply_'s CPU branch, two calls per decoder layer) as one C++
+# elementwise dispatch instead of five torch ops, bit-equal to the torch line on both x dtypes
+# (fp32 trunk stack, fp16 MTP draft stack). EXL3_HC_APPLY_CPU=0 restores the torch path
+_hc_apply_cpu = os.environ.get("EXL3_HC_APPLY_CPU", "1") != "0"
+
 
 def hc_flush(params: dict):
     """Run a deferred HyperConnection.apply_ (held in params["hc_pending"]) before anything other than the
@@ -674,6 +679,15 @@ class GatedResidual(Module):
             y2 = y2.half()
         x3 = x.view(R, self.hc_mult, self.hidden_size)
         if x.device.type != "cuda":
+            # One-dispatch residual update (cpu/hc_mix_cpu.cpp): same eligibility class as the
+            # kernel's checks (it also re-checks, so a miss here can only cost the fallback)
+            if (_hc_apply_cpu and _gr_mix_cpu and self.hc_mult == 4 and 1 <= R <= 8
+                    and self.hidden_size % 16 == 0
+                    and x3.dtype in (torch.half, torch.float)
+                    and post.dtype == torch.float and y2.dtype == torch.half
+                    and x3.is_contiguous() and post.is_contiguous() and y2.is_contiguous()):
+                ext.hc_apply_cpu(x3, post.reshape(R, self.hc_mult), y2)
+                return x
             x3 += post.reshape(R, self.hc_mult, 1).float() * y2.reshape(R, 1, self.hidden_size).float()
             return x
         # Decode-class rows: also emit the successor's weighted stream copy for its fused mix

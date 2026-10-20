@@ -85,6 +85,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gr_mix_cpu", &gr_mix_cpu, "gr_mix_cpu",
           py::call_guard<py::gil_scoped_release>());
     m.def("gr_mix_cpu_has_avx512", &gr_mix_cpu_has_avx512, "gr_mix_cpu_has_avx512");
+    m.def("hc_apply_cpu", &hc_apply_cpu, "hc_apply_cpu",
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("fused_sampler_cpu", &fused_sampler_cpu, "fused_sampler_cpu",
           py::call_guard<py::gil_scoped_release>());
