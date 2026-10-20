@@ -1,0 +1,43 @@
+ninja_required_version = 1.3
+cxx = ccache c++
+
+cflags = -DTORCH_EXTENSION_NAME=exllamav3_ext -DTORCH_API_INCLUDE_EXTENSION_H -I/home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext -I/home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu_compat -isystem /home/daniel/local-llm/cpu-trial/.venv/lib/python3.13/site-packages/torch/include -isystem /home/daniel/local-llm/cpu-trial/.venv/lib/python3.13/site-packages/torch/include/torch/csrc/api/include -isystem /home/daniel/.local/share/uv/python/cpython-3.13.11-linux-x86_64-gnu/include/python3.13 -fPIC -std=c++20 -O3
+post_cflags = 
+cuda_dlink_post_cflags = 
+sycl_dlink_post_cflags = 
+ldflags = -shared -L/home/daniel/local-llm/cpu-trial/.venv/lib/python3.13/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+rule link
+  command = $cxx $in $ldflags -o $out
+
+build cuda_stub.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu_compat/cuda_stub.cpp
+build moe_mul1.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/moe_mul1.cpp
+build linear_mul1.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/linear_mul1.cpp
+build hc_mix_cpu.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/hc_mix_cpu.cpp
+build gdn_step_cpu.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/gdn_step_cpu.cpp
+build ngram_cpu.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/ngram_cpu.cpp
+build router_cpu.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/router_cpu.cpp
+build fused_sampler_cpu.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/cpu/fused_sampler_cpu.cpp
+build avx2_target.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/avx2_target.cpp
+build avx512_target.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/avx512_target.cpp
+build hadamard.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/hadamard.cpp
+build sam.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/sam.cpp
+build stloader.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/stloader.cpp
+build bindings_cpu.o: compile /home/daniel/local-llm/cpu-trial/exllamav3/exllamav3/exllamav3_ext/bindings_cpu.cpp
+
+
+
+
+
+build exllamav3_ext.so: link cuda_stub.o moe_mul1.o linear_mul1.o hc_mix_cpu.o gdn_step_cpu.o ngram_cpu.o router_cpu.o fused_sampler_cpu.o avx2_target.o avx512_target.o hadamard.o sam.o stloader.o bindings_cpu.o
+
+default exllamav3_ext.so

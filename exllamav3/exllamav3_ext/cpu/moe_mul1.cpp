@@ -3388,6 +3388,15 @@ void exl3_moe_cpu_pool_prime(int threads)
     g_pool.prime();
 }
 
+// M4: run a short auxiliary fn on the persistent pool (the router's logits phase) at the pool's
+// current size -- never shrinks or respawns it, and a not-yet-spawned pool runs serially
+void exl3_moe_cpu_pool_run(void (*fn)(void*, int, int), void* ctx, int n_req)
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    if (g_pool.num_workers <= 1) { fn(ctx, 0, 1); return; }
+    g_pool.run(fn, ctx, n_req > 0 && n_req < g_pool.num_workers ? n_req : g_pool.num_workers);
+}
+
 // Exported pool self-test (helpers above live in the anonymous namespace of this TU)
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
 {
