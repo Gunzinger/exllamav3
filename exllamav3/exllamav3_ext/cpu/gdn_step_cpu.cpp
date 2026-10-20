@@ -339,7 +339,7 @@ struct GdnCtx
     uint16_t* cao;                 // (rows, nv * dv) bf16, scan output
     float* wscr;                   // chunk-scan worker scratch, wscr_stride floats per worker
     size_t wscr_stride;
-    int64_t conv_slot_stride;      // conv_state plane stride (chunk scan; slot != 0 pools)
+    int64_t conv_slot_stride;      // conv_state plane stride
     // dims / scalars
     int rows;                      // token rows: bsz (decode) or bsz * T (chunk scan)
     int T;                         // tokens per batch row (chunk scan)
@@ -416,7 +416,7 @@ static void gdn_conv_range(GdnCtx& c, int worker, int nw)
     const int c1 = (int) ((int64_t) fdim * (worker + 1) / nw);
     for (int b = 0; b < c.bsz; ++b)
     {
-        uint16_t* cs = c.conv_state + (size_t) c.conv_slot[b] * c.conv_row_stride;
+        uint16_t* cs = c.conv_state + (size_t) c.conv_slot[b] * c.conv_slot_stride;
         const uint16_t* qr = c.qkv + (size_t) b * fdim;
         uint16_t* mr = c.mixed + (size_t) b * fdim;
         int ci = c0;
@@ -1116,7 +1116,7 @@ void gdn_step_cpu
     c.rows = bsz;
     c.T = 1;
     c.chunk = 0;
-    c.conv_slot_stride = 0;
+    c.conv_slot_stride = conv_state.stride(0);
     c.hidden = hidden;
     c.fdim = fdim;
     c.kdim = kdim;
