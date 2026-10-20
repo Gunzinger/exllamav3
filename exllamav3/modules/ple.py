@@ -124,6 +124,24 @@ class PLELayerState:
 # Prefill row slab for the fused stream pass (see forward_streams); 0 runs the chunk whole
 _ple_sub_range = int(os.environ.get("EXL3_PLE_SUB_CHUNK", "1024"))
 
+# Fused AVX-512 decode-step kernel (cpu/ple_step_cpu.cpp): one ext call for the whole
+# forward_streams_cpu math. Probed once at import (the raising ext stub of the A4 fallback
+# tests keeps every CPU decode on the torch path there); EXL3_PLE_STEP=0 falls back too
+_ple_step_cpu = False
+try:
+    _ple_step_cpu = hasattr(ext, "ple_step_cpu") and bool(ext.ple_step_cpu_has_avx512())
+except Exception:
+    _ple_step_cpu = False
+# M2: fused AVX-512 PLE decode step (cpu/ple_step_cpu.cpp), opt-in. Unit parity vs the torch
+# path is tight (gated stop <= 1.8e-6, conv stream <= 1 fp16 ulp, 16-step loop <= 2 ulp) and it
+# halves the PLE weight stream (fp16 reads, no fp32 casts), but the two GEMVs' fp32 sum order
+# differs from torch.mm, so key/value land +/-1 fp16 ulp from the reference at the rounding
+# boundary; the PLE delta feeds the residual every decode step and that compounding is visible
+# e2e (self-golden: med 16/16 exact, long 10/16 with a 1.1-logit-gap first flip at step 10 and
+# a divergent tail -- a real class change, not coin-flips). Default off keeps greedy decode
+# bit-identical; EXL3_PLE_STEP=1 opts into the ~2 ms/step
+_ple_step_enable = os.environ.get("EXL3_PLE_STEP", "0") == "1"
+
 
 class PLELayer(Module):
 
@@ -170,6 +188,7 @@ class PLELayer(Module):
         self.stub = stub
         self.tp_owner = None
         self._kv_w_f32 = None
+        self._kv_w_h = None
         if stub:
             self.ple_embedding = self.key_proj = self.value_proj = None
             self.norm_key = self.norm_query = self.norm_conv = None
@@ -246,6 +265,7 @@ class PLELayer(Module):
         super().unload()
         self.conv_w = None
         self._kv_w_f32 = None
+        self._kv_w_h = None
 
     @override
     def get_tensors(self):
@@ -421,6 +441,37 @@ class PLELayer(Module):
                 and self.key_proj.inner.bias is None and self.value_proj.inner.bias is None \
                 and self.key_proj.inner.weight.shape == (self.ple_embed_dim, H * D) \
                 and self.value_proj.inner.weight.shape == (self.ple_embed_dim, D):
+            # Fused AVX-512 kernel (cpu/ple_step_cpu.cpp), same math and rounding points as
+            # forward_streams_cpu: the fp16 projections are read in place through a lazy
+            # contiguous cache (never fp32 casts); anything ineligible falls back below
+            nw = (self.norm_key.weight, self.norm_query.weight, self.norm_conv.weight)
+            if (_ple_step_enable and _ple_step_cpu and bsz == 1 and emb.dtype == torch.half
+                    and emb.shape[1] == 1 and emb.is_contiguous()
+                    and self.key_proj.inner.weight.is_contiguous()
+                    and self.value_proj.inner.weight.is_contiguous()
+                    and self.conv_w is not None and self.conv_w.dtype == torch.half
+                    and self.conv_w.is_contiguous()
+                    and self.conv_w.shape == (H * D, 1, self.conv_kernel_size)
+                    and all(w is not None and w.is_contiguous() and w.numel() == H * D
+                            and w.dtype in (torch.half, torch.bfloat16, torch.float) for w in nw)
+                    and (conv_state is None or
+                         (conv_state.dtype == torch.half and conv_state.is_contiguous()
+                          and conv_state.shape == (bsz, H * D, self.conv_state_len)))):
+                wh = self._kv_w_h
+                if wh is None:
+                    wh = (self.key_proj.inner.weight.contiguous(),
+                          self.value_proj.inner.weight.contiguous())
+                    self._kv_w_h = wh
+                delta = torch.empty((bsz, 1, H, D), dtype = torch.float)
+                conv_stream = torch.empty((bsz, H * D, self.conv_state_len + 1), dtype = torch.half)
+                ext.ple_step_cpu(
+                    streams, emb, wh[0], wh[1],
+                    self.norm_key.weight.data, self.norm_query.weight.data, self.norm_conv.weight.data,
+                    self.gate_scale, self.norm_key.rms_norm_eps,
+                    self.norm_key.constant_scale, self.norm_key.constant_bias,
+                    self.conv_w, conv_state, conv_stream, delta, self.conv_dilation,
+                )
+                return delta, conv_stream
             return self.forward_streams_cpu(streams, emb, conv_state)
         return self.forward_streams_reference(streams, emb, params, conv_state)
 
