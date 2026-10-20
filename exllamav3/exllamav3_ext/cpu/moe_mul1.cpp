@@ -23,6 +23,8 @@
 #include <vector>
 
 #ifdef __linux__
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <sched.h>
 #else
@@ -2409,6 +2411,15 @@ inline bool pin_threads_enabled()
     return v;
 }
 
+inline bool pool_futex_enabled()
+{
+    static const bool v = [] {
+        const char* e = std::getenv("EXL3_MOE_POOL_FUTEX");
+        return !(e && *e == '0');
+    }();
+    return v;
+}
+
 struct Pool
 {
     int spawned = 0;
@@ -2464,7 +2475,18 @@ struct Pool
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
                 if (++idle < 65536) { cpu_pause(); continue; }
 #ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (pool_futex_enabled())
+                {
+                    // Same park as hc_mix/gdn: futex on the dispatch word; every publisher
+                    // (run/prime/ensure) FUTEX_WAKEs after the store. The 50 us poll below
+                    // measured +1.6 W of serving-idle package power (E3, e3_idle_power.py)
+                    const uint64_t cmp = seen;
+                    syscall(SYS_futex, (void*) &dispatch, FUTEX_WAIT_PRIVATE, cmp, nullptr, nullptr, 0);
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone
@@ -2504,8 +2526,11 @@ struct Pool
             limit.store(n, std::memory_order_relaxed);
             while (live.load(std::memory_order_acquire) > n - 1)
             {
-#ifndef __linux__
+#ifdef __linux__
                 // Repeated: a worker that read the old limit may only now be parking
+                if (pool_futex_enabled())
+                    syscall(SYS_futex, (void*) &dispatch, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#else
                 WakeByAddressAll(&dispatch);
 #endif
                 std::this_thread::yield();
@@ -2531,7 +2556,10 @@ struct Pool
     void prime()
     {
         dispatch.store((++generation << DISPATCH_NW_BITS), std::memory_order_release);
-#ifndef __linux__
+#ifdef __linux__
+        if (pool_futex_enabled())
+            syscall(SYS_futex, (void*) &dispatch, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#else
         WakeByAddressAll(&dispatch);
 #endif
     }
@@ -2550,7 +2578,10 @@ struct Pool
         const uint64_t d0 = done.load(std::memory_order_acquire);
         ++generation;
         dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
-#ifndef __linux__
+#ifdef __linux__
+        if (pool_futex_enabled())
+            syscall(SYS_futex, (void*) &dispatch, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#else
         WakeByAddressAll(&dispatch);
 #endif
         f(c, 0, n);
