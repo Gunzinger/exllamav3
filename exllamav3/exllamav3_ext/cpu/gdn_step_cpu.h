@@ -62,5 +62,45 @@ void gdn_step_cpu
     int num_threads
 );
 
+// Fused CPU prefill pass of the split-projection GatedDeltaNet (work package T3): the whole
+// middle section between the qkv/z projection and the output projection for T tokens in one
+// call. Same gate math, conv formulation and gated-norm epilogue as gdn_step_cpu extended over
+// the sequence (the conv walks the state window forward token by token and leaves the last
+// kdim raw tokens in it), with the scan in the chunked WY form of
+// torch_chunk_gated_delta_rule_cpu (gated_delta_rule.py:85): per chunk of 64 tokens, G =
+// cumsum(g), A = tril_strict((k_i.k_j) e^{G_i-G_j} beta_i), X = (I+A)^-1, w = X (beta e^G k),
+// u = X (beta v), v_new = u - w h, o_i = e^{G_i}(q_i h) + sum_{j<=i}(q_i.k_j) e^{G_i-G_j}
+// v_new_j, chunk close h <- h e^{G_last} + sum_i k_i (v_new_i e^{G_last-G_i}). All math fp32;
+// no history rows, the state row is read at t = 0 and written back once at t = T-1 (fp16 pools
+// round RNE on the store). Shape arguments as gdn_step_cpu with the seqlen dim T instead of 1:
+//   x: (bsz, T, hidden) half; qkv: (bsz, T, fdim_qkv) half; z: (bsz, T, nv, dv) float or half;
+//   out: (bsz, T, nv * dv) half
+void gdn_chunk_scan_cpu
+(
+    const at::Tensor& x,                // (bsz, T, hidden) fp16, layer input
+    const at::Tensor& qkv,              // (bsz, T, fdim_qkv) fp16, split qkv projection output
+    const at::Tensor& z,                // (bsz, T, nv, dv) fp32 or fp16, output gate
+    const at::Tensor& conv_state,       // (max_batch, fdim_qkv, kdim + hist) bf16, updated in place
+    const at::Tensor& conv_w,           // (kdim, fdim_qkv) fp32
+    const std::optional<at::Tensor>& conv_b,    // (fdim_qkv,) fp32 or nullopt
+    const std::optional<at::Tensor>& wb,        // (hidden, nv) fp16 b projection, or nullopt
+    const std::optional<at::Tensor>& bb,        // (nv,) fp16 b bias, or nullopt
+    const std::optional<at::Tensor>& wa,        // (hidden, nv) fp16 a projection, or nullopt
+    const std::optional<at::Tensor>& ba,        // (nv,) fp16 a bias, or nullopt
+    const at::Tensor& dt_bias,          // (nv,) fp32
+    const at::Tensor& a_log,            // (nv,) fp32
+    const at::Tensor& recurrent_state,  // (rows, 1, nv, dk, dv) fp32 or half, scan rows updated in place
+    const at::Tensor& conv_slots,       // (bsz,) int conv ring rows
+    const at::Tensor& scan_slots,       // (bsz,) int recurrent state rows
+    const at::Tensor& norm_w,           // (dv,) fp32
+    at::Tensor& out,                    // (bsz, T, nv * dv) half, gated norm output (o_proj input)
+    double beta_scale,
+    double rms_eps,
+    double norm_bias_add,
+    bool gate_sigmoid,
+    bool z_is_half,
+    int num_threads
+);
+
 // True when the AVX-512 tier this kernel needs is present at runtime.
 bool gdn_step_cpu_has_avx512();
