@@ -53,7 +53,9 @@ def torch_recurrent_gated_delta_rule_cpu(
     else:
         idx = recurrent_slots.long() if recurrent_slots is not None else None
         in_idx = slots_in.long() if slots_in is not None else idx
-        state = (recurrent_state[in_idx, 0] if in_idx is not None else recurrent_state[:bsz, 0]).clone()
+        # .float(): the step math is fp32; the state pool may be fp16 (recurrent_dtype default since
+        # 02446529) and is written back through the implicit cast of the index assignments below
+        state = (recurrent_state[in_idx, 0] if in_idx is not None else recurrent_state[:bsz, 0]).clone().float()
 
     # The step math is expressed as batched GEMMs over (bsz * nv, dk, dv): the broadcast
     # elementwise form moves the fp32 state through ~5 full-size temporaries per token
@@ -68,15 +70,15 @@ def torch_recurrent_gated_delta_rule_cpu(
         out[:, t] = (torch.matmul(q[:, t].unsqueeze(-2), state).squeeze(-2) * scale).to(torch.bfloat16)
         if history and slots_in is None and t < seqlen - 1 and recurrent_state is not None:
             if idx is not None:
-                recurrent_state[idx, t + 1] = state
+                recurrent_state[idx, t + 1] = state.to(recurrent_state.dtype)
             else:
-                recurrent_state[:bsz, t + 1] = state
+                recurrent_state[:bsz, t + 1] = state.to(recurrent_state.dtype)
 
     if save_state and recurrent_state is not None:
         if idx is not None:
-            recurrent_state[idx, 0] = state
+            recurrent_state[idx, 0] = state.to(recurrent_state.dtype)
         else:
-            recurrent_state[:bsz, 0] = state
+            recurrent_state[:bsz, 0] = state.to(recurrent_state.dtype)
     return out
 
 
@@ -118,7 +120,9 @@ def torch_chunk_gated_delta_rule_cpu(
 
     for bi in range(bsz):
         slot = int(recurrent_slots[bi]) if recurrent_slots is not None else bi
-        h = recurrent_state[slot, 0].clone() if recurrent_state is not None \
+        # .float(): fp32 chunk math against a possibly-fp16 state pool (recurrent_dtype default
+        # since 02446529); the store at the end casts back through the index assignment
+        h = recurrent_state[slot, 0].clone().float() if recurrent_state is not None \
             else torch.zeros(num_v_heads, k_head_dim, v_head_dim, dtype = torch.float)
         beta_b = beta[bi]
         g_b = g[bi]
@@ -152,7 +156,7 @@ def torch_chunk_gated_delta_rule_cpu(
             h = h * G_last.exp()[:, None, None] + \
                 kc.transpose(-1, -2) @ (v_new * (G_last[:, None] - G).exp()[:, :, None])
         if save_state and recurrent_state is not None:
-            recurrent_state[slot, 0] = h
+            recurrent_state[slot, 0] = h.to(recurrent_state.dtype)
     return out
 
 def torch_recurrent_gated_delta_rule(
