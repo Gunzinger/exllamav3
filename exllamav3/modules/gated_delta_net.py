@@ -35,6 +35,10 @@ _gdn_step_enable = os.environ.get("EXL3_GDN_STEP", "1") != "0"
 # Worker count of the fused step's pool; 0 leaves the kernel's own default (1: waking parked
 # workers under the moe pool + system load measured far worse than the single-threaded sweep)
 _gdn_step_threads = int(os.environ.get("EXL3_GDN_STEP_CPU_THREADS", "0"))
+# EXL3_GDN_CHUNK_SCAN=0 disables the fused CPU prefill pass (gdn_chunk_scan_cpu), for A/B testing
+_gdn_chunk_scan_enable = os.environ.get("EXL3_GDN_CHUNK_SCAN", "1") != "0"
+# Worker count of the prefill pass's pool; 0 leaves the kernel's own default (4)
+_gdn_chunk_scan_threads = int(os.environ.get("EXL3_GDN_CHUNK_SCAN_THREADS", "0"))
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import (
     causal_conv1d_update,
@@ -1561,6 +1565,44 @@ class GatedDeltaNet(Module):
                         self.beta_scale, self.rms_norm_eps, 0.0,
                         st["gate_sigmoid"], z.dtype == torch.half,
                         _gdn_step_threads,
+                    )
+                    del qkv, z
+                    x = self.o_proj.forward(out, params)
+                    if self.tp_reduce:
+                        self.tp_collect(params["backend"], x)
+                    return to2(x, out_dtype, self.out_dtype)
+
+            # Fused CPU prefill pass: b/a projections + beta/g gates + full-sequence conv +
+            # chunked WY delta-rule scan + gated norm in one call (gdn_chunk_scan_cpu; the
+            # torch chain below stays as the fallback and parity reference). CPU prefill-shaped
+            # passes with a state pool; the decode step above takes seqlen == 1
+            if (
+                _gdn_chunk_scan_enable and
+                x.device.type == "cpu" and
+                seqlen >= 2 and
+                save_state and not save_history and
+                qkv.dtype == torch.half and x.dtype == torch.half and
+                x.is_contiguous() and qkv.is_contiguous() and
+                z.dtype in (torch.half, torch.float) and z.is_contiguous() and
+                recurrent_state is not None and recurrent_state.dtype in (torch.float, torch.half) and
+                hasattr(ext, "gdn_chunk_scan_cpu") and ext.gdn_step_cpu_has_avx512()
+            ):
+                st = self._gdn_step_statics()
+                if st is not None:
+                    out = torch.empty(bsz, seqlen, self.num_v_heads * self.v_head_dim,
+                                      dtype = torch.half, device = x.device)
+                    ext.gdn_chunk_scan_cpu(
+                        x, qkv, z,
+                        conv_state,
+                        st["conv_w"], st["conv_b"],
+                        st["wb"], st["bb"], st["wa"], st["ba"],
+                        st["dt_bias"], st["a_log"],
+                        recurrent_state,
+                        recurrent_slots, slots_scan,
+                        st["norm_w"], out,
+                        self.beta_scale, self.rms_norm_eps, 0.0,
+                        st["gate_sigmoid"], z.dtype == torch.half,
+                        _gdn_chunk_scan_threads,
                     )
                     del qkv, z
                     x = self.o_proj.forward(out, params)

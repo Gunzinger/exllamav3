@@ -94,6 +94,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gdn_step_cpu", &gdn_step_cpu, "gdn_step_cpu",
           py::call_guard<py::gil_scoped_release>());
     m.def("gdn_step_cpu_has_avx512", &gdn_step_cpu_has_avx512, "gdn_step_cpu_has_avx512");
+    m.def("gdn_chunk_scan_cpu", &gdn_chunk_scan_cpu, "gdn_chunk_scan_cpu",
+          py::call_guard<py::gil_scoped_release>());
 
     m.def("sdpa_paged_cpu", &sdpa_paged_cpu, "sdpa_paged_cpu",
           py::arg("q"), py::arg("k_new"), py::arg("v_new"), py::arg("k_cache"),
