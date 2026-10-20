@@ -14,6 +14,7 @@
 #include "cpu/moe_mul1.h"
 #include "cpu/hc_mix_cpu.h"
 #include "cpu/gdn_step_cpu.h"
+#include "cpu/sdpa_paged_cpu.h"
 #include "cpu/ple_step_cpu.h"
 #include "cpu/fused_sampler_cpu.h"
 #include "cpu/router_cpu.h"
@@ -93,6 +94,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("gdn_step_cpu", &gdn_step_cpu, "gdn_step_cpu",
           py::call_guard<py::gil_scoped_release>());
     m.def("gdn_step_cpu_has_avx512", &gdn_step_cpu_has_avx512, "gdn_step_cpu_has_avx512");
+
+    m.def("sdpa_paged_cpu", &sdpa_paged_cpu, "sdpa_paged_cpu",
+          py::arg("q"), py::arg("k_new"), py::arg("v_new"), py::arg("k_cache"),
+          py::arg("v_cache"), py::arg("block_table"), py::arg("cache_seqlens"),
+          py::arg("scale"), py::arg("out"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("sdpa_paged_cpu_has_avx512", &sdpa_paged_cpu_has_avx512, "sdpa_paged_cpu_has_avx512");
 
     m.def("ple_step_cpu", &ple_step_cpu, "ple_step_cpu",
           py::call_guard<py::gil_scoped_release>());

@@ -65,6 +65,7 @@ CPU_SOURCES = [
     "cpu/linear_mul1.cpp",
     "cpu/hc_mix_cpu.cpp",
     "cpu/gdn_step_cpu.cpp",
+    "cpu/sdpa_paged_cpu.cpp",
     "cpu/ple_step_cpu.cpp",
     "cpu/ngram_cpu.cpp",
     "cpu/router_cpu.cpp",

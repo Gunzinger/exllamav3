@@ -1,6 +1,8 @@
+import os
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 from ...util.backend import sdpa_prefill, fa75_prefill
+from ...ext import exllamav3_ext as ext
 import torch.nn.functional as F
 
 
@@ -23,6 +25,12 @@ def _warn_sdpa_fallback():
         f"or `xformers` to improve performance.{col_default}"
     )
     has_warned_sdpa_fallback = True
+
+
+# C7 fused paged-attention kernel (ext.sdpa_paged_cpu): reads the KV pages in place, no gather.
+# Opt-in (EXL3_SDPA_PAGED_CPU=1); every ineligible shape keeps the torch path below
+_sdpa_paged_cpu = getattr(ext, "sdpa_paged_cpu_has_avx512", lambda: False)()
+_sdpa_paged_cpu_enable = os.environ.get("EXL3_SDPA_PAGED_CPU", "0") == "1"
 
 
 def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
@@ -103,12 +111,69 @@ def fn_torch_sdpa_cpu_paged(args: AttnArgs) -> torch.Tensor | None:
         return None
     if not args.causal:
         return None
+    if (
+        _sdpa_paged_cpu_enable and _sdpa_paged_cpu and
+        args.q_len <= 8 and
+        16 <= args.dim <= 512 and args.dim % 16 == 0 and
+        args.num_q_heads <= 64 and
+        args.q.shape[1] == args.k.shape[1] and
+        args.q.dtype == torch.float16 and args.k.dtype == torch.float16 and
+        args.v.dtype == torch.float16 and args.k_cache.dtype == torch.float16 and
+        args.v_cache.dtype == torch.float16 and
+        args.q.is_contiguous() and args.k.is_contiguous() and args.v.is_contiguous() and
+        args.k_cache.is_contiguous() and args.v_cache.is_contiguous() and
+        args.block_table.is_contiguous()
+    ):
+        out = torch.empty_like(args.q)
+        ext.sdpa_paged_cpu(
+            args.q, args.k, args.v,
+            args.k_cache, args.v_cache,
+            args.block_table, args.cache_seqlens,
+            args.sm_scale, out,
+        )
+        _torch_paged_writeback(args.k, args.v, args.k_cache, args.v_cache,
+                               args.block_table, args.cache_seqlens)
+        return out
     return _torch_paged_gather_sdpa(
         args.q, args.k, args.v,
         args.k_cache, args.v_cache,
         args.block_table, args.cache_seqlens,
         args.sm_scale,
     )
+
+
+def _torch_paged_writeback(k, v, k_cache, v_cache, block_table, cache_seqlens):
+    """Write the new tokens' K/V rows into the paged cache (the tail of _torch_paged_gather_sdpa,
+    shared with the ext.sdpa_paged_cpu fast path)"""
+    batch, seqlen_new, _, _ = k.shape
+    block_size = k_cache.shape[1]
+
+    for b in range(batch):
+        seq_len = cache_seqlens[b].item()
+        total_len = seq_len + seqlen_new
+
+        num_blocks_needed = (total_len + block_size - 1) // block_size
+        phys_blocks = block_table[b, :num_blocks_needed]
+
+        first_block = seq_len // block_size
+        last_block = (total_len - 1) // block_size
+
+        for block_idx in range(first_block, last_block + 1):
+            phys = phys_blocks[block_idx]
+            blk_start = block_idx * block_size
+            blk_end = blk_start + block_size
+
+            write_start = max(blk_start, seq_len)
+            write_end = min(blk_end, total_len)
+
+            off_start = write_start - blk_start
+            off_end = write_end - blk_start
+
+            src_start = write_start - seq_len
+            src_end = write_end - seq_len
+
+            k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
+            v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
 
 
 def _torch_paged_gather_sdpa(
@@ -150,26 +215,7 @@ def _torch_paged_gather_sdpa(
         outputs.append(_attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
                                       fa75 = turing and plain, group_gqa = turing))
 
-        # Write back only the new tokens to the paged cache
-        first_block = seq_len // block_size
-        last_block = (total_len - 1) // block_size
-
-        for block_idx in range(first_block, last_block + 1):
-            phys = phys_blocks[block_idx]
-            blk_start = block_idx * block_size
-            blk_end = blk_start + block_size
-
-            write_start = max(blk_start, seq_len)
-            write_end = min(blk_end, total_len)
-
-            off_start = write_start - blk_start
-            off_end = write_end - blk_start
-
-            src_start = write_start - seq_len
-            src_end = write_end - seq_len
-
-            k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
-            v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
+        _torch_paged_writeback(k, v, k_cache, v_cache, block_table, cache_seqlens)
 
     return torch.stack(outputs)
 
