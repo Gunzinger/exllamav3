@@ -3696,6 +3696,144 @@ void exl3_moe_cpu_forward
     );
 }
 
+// The torch epilogue here runs entirely in fp32 (the shared gate Linear's out_dtype is float, so
+// g and sigmoid(g) are never rounded to half); this function is compiled at baseline ISA (no
+// target attribute), so the compiler cannot contract the mul-add into an fma and the schedule
+// survives as written. ATen's fp32 CPU sigmoid is size- and position-dependent: below 32 rows it
+// is the scalar libm kernel at every position, from 32 rows the vectorized Sleef u10 kernel
+// covers full 32-element super-chunks (two 16-wide vectors per loop step, AVX-512 build) and the
+// remainder returns to the scalar kernel. Both forms are reproduced here; the caller gates the
+// fast path on exl3_moe_cpu_has_avx512_bw so the split always lines up with torch's.
+
+M1_TARGET_BW
+static inline float gate_sigmoid_vec(float x)
+{
+    // Sleef u10 expf (sleefsimdsp.c xexpf), the exp ATen's vectorized sigmoid runs on AVX-512;
+    // bit-matched against torch.sigmoid on random, boundary and discriminator inputs
+    const __m512 d = _mm512_set1_ps(-x);
+    const __m512 rln2 = _mm512_set1_ps(1.442695040888963407359924681001892137426645954152985934135449406931f);
+    const __m512 nl2u = _mm512_set1_ps(-0.693145751953125f);
+    const __m512 nl2l = _mm512_set1_ps(-1.428606765330187045e-06f);
+    __m512i q = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(d, rln2),
+                                                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m512 qf = _mm512_cvtepi32_ps(q);
+    __m512 s = _mm512_fmadd_ps(qf, nl2u, d);
+    s = _mm512_fmadd_ps(qf, nl2l, s);
+    __m512 u = _mm512_set1_ps(0.000198527617612853646278381f);
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.00139304355252534151077271f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.00833336077630519866943359f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.0416664853692054748535156f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.166666671633720397949219f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.5f));
+    u = _mm512_add_ps(_mm512_set1_ps(1.0f), _mm512_fmadd_ps(_mm512_mul_ps(s, s), u, s));
+    __m512i qh = _mm512_srai_epi32(q, 1);
+    __m512 u1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_add_epi32(qh, _mm512_set1_epi32(0x7f)), 23));
+    __m512 u2 = _mm512_castsi512_ps(_mm512_slli_epi32(
+        _mm512_add_epi32(_mm512_sub_epi32(q, qh), _mm512_set1_epi32(0x7f)), 23));
+    u = _mm512_mul_ps(_mm512_mul_ps(u, u1), u2);
+    u = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(d, _mm512_set1_ps(-104.0f), _CMP_GE_OQ), u);
+    u = _mm512_mask_mov_ps(u, _mm512_cmp_ps_mask(d, _mm512_set1_ps(100.0f), _CMP_GT_OQ),
+                           _mm512_set1_ps(__builtin_inff()));
+    return _mm512_cvtss_f32(_mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f), u)));
+}
+
+static inline float gate_sigmoid(float x, bool vectorized)
+{
+    if (vectorized)
+        return gate_sigmoid_vec(x);
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+at::Tensor exl3_moe_cpu_forward_gated
+(
+    int64_t handle,
+    const at::Tensor& x,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& routed,
+    const at::Tensor& gate_w,
+    int64_t num_threads,
+    bool half_out
+)
+{
+    TORCH_CHECK(x.device().is_cpu() && selected.device().is_cpu() && weights.device().is_cpu()
+                && routed.device().is_cpu() && gate_w.device().is_cpu(), "CPU MoE tensors must be on CPU");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && weights.scalar_type() == at::kHalf
+                && routed.scalar_type() == at::kFloat && gate_w.scalar_type() == at::kFloat, "dtype mismatch");
+    TORCH_CHECK(x.dim() == 2 && selected.dim() == 2 && selected.size(0) == x.size(0)
+                && weights.sizes() == selected.sizes(),
+                "exl3_moe_cpu_forward_gated: x must be (rows, hidden), selected and weights (rows, top_k)");
+    TORCH_CHECK(x.is_contiguous() && selected.is_contiguous() && weights.is_contiguous()
+                && routed.is_contiguous() && gate_w.is_contiguous(),
+                "exl3_moe_cpu_forward_gated: tensors must be contiguous");
+    const MoeCpuLayer* layer = get_layer(handle);
+    TORCH_CHECK(x.size(1) == layer->hidden_size && routed.sizes() == x.sizes(),
+                "exl3_moe_cpu_forward_gated: x and routed must be (rows, hidden_size)");
+    TORCH_CHECK(gate_w.dim() == 2 && gate_w.size(0) == layer->hidden_size && gate_w.size(1) == 1,
+                "exl3_moe_cpu_forward_gated: gate_w must be (hidden_size, 1)");
+
+    const int m_total = static_cast<int>(x.size(0));
+    const int top_k = static_cast<int>(selected.size(-1));
+    const int H = layer->hidden_size;
+
+    // g as LinearFP16.forward computes it on CPU: the same fp32 at::matmul (fp32 accumulate, no
+    // intermediate rounding — the gate Linear's out_dtype is float)
+    at::Tensor g = at::matmul(x.to(at::kFloat), gate_w);
+    const float* gp = g.data_ptr<float>();
+    const at::Half* xp = reinterpret_cast<const at::Half*>(x.data_ptr());
+
+    std::vector<int32_t> sel32(static_cast<size_t>(m_total) * top_k);
+    if (selected.scalar_type() == at::kLong)
+    {
+        const int64_t* s = selected.data_ptr<int64_t>();
+        for (size_t i = 0; i < sel32.size(); ++i) sel32[i] = static_cast<int32_t>(s[i]);
+    }
+    else
+    {
+        TORCH_CHECK(selected.scalar_type() == at::kInt, "selected must be int32 or int64");
+        std::memcpy(sel32.data(), selected.data_ptr<int32_t>(), sel32.size() * 4);
+    }
+
+    std::vector<float> sh(static_cast<size_t>(m_total) * H);
+    exl3_moe_cpu_forward_raw
+    (
+        handle,
+        xp,
+        sel32.data(),
+        reinterpret_cast<const at::Half*>(weights.data_ptr()),
+        sh.data(),
+        m_total, top_k,
+        static_cast<int>(num_threads)
+    );
+
+    // sigmoid(g) in fp32 (the shared gate Linear's out_dtype is float), ATen's kernel split:
+    // scalar libm below 32 rows and on the remainder, Sleef u10 vectorized on the super-chunks
+    at::Tensor out = half_out ? at::empty({m_total, H}, x.options().dtype(at::kHalf)) : routed;
+    const float* rp = routed.data_ptr<float>();
+    at::Half* oh = half_out ? out.data_ptr<at::Half>() : nullptr;
+    float* of = half_out ? nullptr : out.data_ptr<float>();
+    const int n_vec = g_isa >= Isa::Bw ? (m_total / 32) * 32 : 0;
+    for (int r = 0; r < m_total; ++r)
+    {
+        const float sig = gate_sigmoid(gp[r], r < n_vec);
+        const float* shv = sh.data() + static_cast<size_t>(r) * H;
+        const float* rv = rp + static_cast<size_t>(r) * H;
+        if (half_out)
+        {
+            at::Half* ov = oh + static_cast<size_t>(r) * H;
+            for (int d = 0; d < H; ++d)
+                ov[d] = at::Half(rv[d] + shv[d] * sig);
+        }
+        else
+        {
+            float* ov = of + static_cast<size_t>(r) * H;
+            for (int d = 0; d < H; ++d)
+                ov[d] = rv[d] + shv[d] * sig;
+        }
+    }
+    return out;
+}
+
 // -------------------------------------------------------------------------------------------
 //   Standalone dense-linear forward (cpu/linear_mul1.cpp): one MoeCpuMatrix end to end
 // -------------------------------------------------------------------------------------------
@@ -4102,6 +4240,11 @@ int64_t exl3_moe_cpu_make_layer(
 void exl3_moe_cpu_free_layer(int64_t) {}
 void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
 void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }
+at::Tensor exl3_moe_cpu_forward_gated(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, bool)
+{
+    NO_MOE_CPU();
+    return {};
+}
 MoeCpuMatrix exl3_cpu_mul1_make_matrix(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor*, bool)
 {
     NO_MOE_CPU();
