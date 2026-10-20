@@ -1539,7 +1539,7 @@ class GatedDeltaNet(Module):
                 seqlen == 1 and
                 save_state and not save_history and
                 qkv.dtype == torch.half and x.dtype == torch.half and x.is_contiguous() and
-                recurrent_state is not None and recurrent_state.dtype == torch.float and
+                recurrent_state is not None and recurrent_state.dtype in (torch.float, torch.half) and
                 hasattr(ext, "gdn_step_cpu") and ext.gdn_step_cpu_has_avx512()
             ):
                 st = self._gdn_step_statics()

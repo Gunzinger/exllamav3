@@ -237,6 +237,25 @@ inline void gdn_half_store(at::Half* dst, __m512 v)
 }
 
 GDN_TARGET_AVX512
+inline float gdn_half_to_f32(uint16_t h)
+{
+    return _cvtsh_ss(h);
+}
+
+GDN_TARGET_AVX512
+inline uint16_t gdn_f32_to_half(float v)
+{
+    return (uint16_t) _cvtss_sh(v, _MM_FROUND_TO_NEAREST_INT);
+}
+
+// 16 fp16 -> one f32 vector in a single vcvtph2ps (256-bit source, 16 lanes)
+GDN_TARGET_AVX512
+inline __m512 gdn_half_load16(const uint16_t* p)
+{
+    return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*) p));
+}
+
+GDN_TARGET_AVX512
 inline float gdn_sumsq(const float* x, int n)
 {
     __m512 acc = _mm512_setzero_ps();
@@ -292,8 +311,10 @@ struct GdnCtx
     const uint16_t* ba;            // (nv,) fp16, nullable
     const float* dt_bias;          // (nv,) fp32
     const float* a_log;            // (nv,) fp32
-    float* recurrent_state;        // (rows, nv, dk, dv) fp32, scan rows updated in place
-    int64_t state_row_stride;      // floats per pool row
+    float* recurrent_state;        // (rows, nv, dk, dv) fp32 view, scan rows updated in place
+    uint16_t* recurrent_state_h;   // same pool as fp16 (recurrent_dtype = half since 02446529)
+    int state_half;                // pool storage dtype: 0 = fp32, 1 = fp16
+    int64_t state_row_stride;      // elements per pool row (dtype-independent)
     const float* norm_w;           // (dv,) fp32
     at::Half* out;                 // (bsz, nv * dv) half, gated norm output
     // scratch
@@ -422,7 +443,11 @@ static void gdn_conv_range(GdnCtx& c, int worker, int nw)
 }
 
 // one-token grouped delta-rule scan: in-kernel q/k l2norm (eps 1e-6), undecayed state readback,
-// u = beta (v - decay k^T state), state <- state * decay + k u^T, out = bf16(scale q^T state)
+// u = beta (v - decay k^T state), state <- state * decay + k u^T, out = bf16(scale q^T state).
+// SH: the state pool's storage dtype (fp16 since recurrent_dtype defaulted to half in 02446529).
+// The scan math is fp32 either way; the fp16 pool converts on the load and rounds RNE once per
+// step on the store, matching the torch fallback's per-pass rounding (gated_delta_rule.py)
+template <bool SH>
 GDN_TARGET_AVX512
 static void gdn_scan_range(GdnCtx& c, int worker, int nw)
 {
@@ -440,7 +465,10 @@ static void gdn_scan_range(GdnCtx& c, int worker, int nw)
         const uint16_t* qr = mr;
         const uint16_t* kr = mr + c.nk * dk;
         const uint16_t* vr = mr + 2 * c.nk * dk;
-        float* st = c.recurrent_state + (size_t) c.scan_slot[b] * c.state_row_stride;
+        float* st;
+        uint16_t* sth;
+        if constexpr (SH) sth = c.recurrent_state_h + (size_t) c.scan_slot[b] * c.state_row_stride;
+        else st = c.recurrent_state + (size_t) c.scan_slot[b] * c.state_row_stride;
         for (int i = h0; i < h1; ++i)
         {
             const int kh = i / group;
@@ -452,7 +480,7 @@ static void gdn_scan_range(GdnCtx& c, int worker, int nw)
             for (int d = 0; d < dk; ++d) { kf[d] *= kinv; qf[d] *= qinv; }
             const float decay = std::exp(c.g[(size_t) b * nv + i]);
             const float betaf = gdn_bf16_to_f32(c.beta[(size_t) b * nv + i]);
-            float* s = st + (size_t) i * dk * dv;
+            const size_t soff = (size_t) i * dk * dv;
             const uint16_t* vp = vr + (size_t) i * dv;
             uint16_t* op = c.cao + (size_t) (b * nv + i) * dv;
             const __m512 dcy = _mm512_set1_ps(decay), bcy = _mm512_set1_ps(betaf);
@@ -462,7 +490,12 @@ static void gdn_scan_range(GdnCtx& c, int worker, int nw)
                 // kv_mem = k^T state (undecayed readback)
                 __m512 acc = _mm512_setzero_ps();
                 for (int d = 0; d < dk; ++d)
-                    acc = _mm512_fmadd_ps(_mm512_loadu_ps(s + (size_t) d * dv + v), _mm512_set1_ps(kf[d]), acc);
+                {
+                    __m512 sv;
+                    if constexpr (SH) sv = gdn_half_load16(sth + soff + (size_t) d * dv + v);
+                    else sv = _mm512_loadu_ps(st + soff + (size_t) d * dv + v);
+                    acc = _mm512_fmadd_ps(sv, _mm512_set1_ps(kf[d]), acc);
+                }
                 _mm512_storeu_ps(kvm + v, acc);
                 // u = beta (v - decay kv_mem)
                 __m512 vv = gdn_bf16_load(vp + v);
@@ -472,9 +505,12 @@ static void gdn_scan_range(GdnCtx& c, int worker, int nw)
                 __m512 oac = _mm512_setzero_ps();
                 for (int d = 0; d < dk; ++d)
                 {
-                    __m512 sv = _mm512_mul_ps(_mm512_loadu_ps(s + (size_t) d * dv + v), dcy);
-                    sv = _mm512_fmadd_ps(_mm512_set1_ps(kf[d]), uv, sv);
-                    _mm512_storeu_ps(s + (size_t) d * dv + v, sv);
+                    __m512 sv;
+                    if constexpr (SH) sv = gdn_half_load16(sth + soff + (size_t) d * dv + v);
+                    else sv = _mm512_loadu_ps(st + soff + (size_t) d * dv + v);
+                    sv = _mm512_fmadd_ps(_mm512_set1_ps(kf[d]), uv, _mm512_mul_ps(sv, dcy));
+                    if constexpr (SH) gdn_half_store((at::Half*) (sth + soff + (size_t) d * dv + v), sv);
+                    else _mm512_storeu_ps(st + soff + (size_t) d * dv + v, sv);
                     oac = _mm512_fmadd_ps(_mm512_set1_ps(qf[d]), sv, oac);
                 }
                 gdn_bf16_store(op + v, _mm512_mul_ps(oac, _mm512_set1_ps(scale)));
@@ -482,14 +518,31 @@ static void gdn_scan_range(GdnCtx& c, int worker, int nw)
             for (; v < dv; ++v)
             {
                 float acc = 0.0f;
-                for (int d = 0; d < dk; ++d) acc = std::fma(s[(size_t) d * dv + v], kf[d], acc);
+                for (int d = 0; d < dk; ++d)
+                {
+                    float sd;
+                    if constexpr (SH) sd = gdn_half_to_f32(sth[soff + (size_t) d * dv + v]);
+                    else sd = st[soff + (size_t) d * dv + v];
+                    acc = std::fma(sd, kf[d], acc);
+                }
                 const float uv = (gdn_bf16_to_f32(vp[v]) - acc * decay) * betaf;
                 float oac = 0.0f;
                 for (int d = 0; d < dk; ++d)
                 {
-                    float& sd = s[(size_t) d * dv + v];
-                    sd = sd * decay + kf[d] * uv;
-                    oac = std::fma(qf[d], sd, oac);
+                    const size_t off = soff + (size_t) d * dv + v;
+                    if constexpr (SH)
+                    {
+                        float sd = gdn_half_to_f32(sth[off]);
+                        sd = sd * decay + kf[d] * uv;
+                        sth[off] = gdn_f32_to_half(sd);
+                        oac = std::fma(qf[d], sd, oac);
+                    }
+                    else
+                    {
+                        float& sd = st[off];
+                        sd = sd * decay + kf[d] * uv;
+                        oac = std::fma(qf[d], sd, oac);
+                    }
                 }
                 op[v] = gdn_f32_to_bf16(oac * scale);
             }
@@ -546,7 +599,8 @@ static void gdn_pool_fn(void* vctx, int worker, int nw)
     gdn_conv_range(c, worker, nw);
     c.bar1.fetch_add(1, std::memory_order_acq_rel);
     while (c.bar1.load(std::memory_order_acquire) < nw) gdn_pause();
-    gdn_scan_range(c, worker, nw);
+    if (c.state_half) gdn_scan_range<true>(c, worker, nw);
+    else gdn_scan_range<false>(c, worker, nw);
     c.bar2.fetch_add(1, std::memory_order_acq_rel);
     while (c.bar2.load(std::memory_order_acquire) < nw) gdn_pause();
     gdn_norm_range(c, worker, nw);
@@ -631,9 +685,10 @@ void gdn_step_cpu
                 "dt_bias must be contiguous CPU float (nv,)");
     TORCH_CHECK(a_log.scalar_type() == at::kFloat && a_log.is_contiguous() && a_log.numel() == nv,
                 "a_log must be contiguous CPU float (nv,)");
-    TORCH_CHECK(recurrent_state.scalar_type() == at::kFloat && recurrent_state.is_contiguous() &&
+    TORCH_CHECK((recurrent_state.scalar_type() == at::kFloat || recurrent_state.scalar_type() == at::kHalf) &&
+                recurrent_state.is_contiguous() &&
                 recurrent_state.dim() == 5 && recurrent_state.size(1) == 1,
-                "recurrent_state must be contiguous CPU float (rows, 1, nv, dk, dv)");
+                "recurrent_state must be contiguous CPU float or half (rows, 1, nv, dk, dv)");
     TORCH_CHECK(recurrent_state.size(2) == nv && recurrent_state.size(4) == dv,
                 "recurrent_state shape mismatch");
     const int dk = (int) recurrent_state.size(3);
@@ -671,7 +726,9 @@ void gdn_step_cpu
     c.ba = ba ? reinterpret_cast<const uint16_t*>(ba->data_ptr<at::Half>()) : nullptr;
     c.dt_bias = dt_bias.data_ptr<float>();
     c.a_log = a_log.data_ptr<float>();
-    c.recurrent_state = recurrent_state.data_ptr<float>();
+    c.state_half = recurrent_state.scalar_type() == at::kHalf ? 1 : 0;
+    c.recurrent_state = c.state_half ? nullptr : recurrent_state.data_ptr<float>();
+    c.recurrent_state_h = c.state_half ? reinterpret_cast<uint16_t*>(recurrent_state.data_ptr<at::Half>()) : nullptr;
     c.state_row_stride = recurrent_state.stride(0);
     c.norm_w = norm_w.data_ptr<float>();
     c.out = out.data_ptr<at::Half>();

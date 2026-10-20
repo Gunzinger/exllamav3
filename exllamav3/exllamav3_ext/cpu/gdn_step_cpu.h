@@ -29,7 +29,9 @@
 //   conv_b:        (fdim_qkv,) float, or nullopt
 //   wb/wa:         (hidden, nv) half, or nullopt (bb/ba: (nv,) half biases)
 //   dt_bias/a_log: (nv,) float
-//   recurrent_state: (rows, 1, nv, dk, dv) float, updated in place (rows scan_slots)
+//   recurrent_state: (rows, 1, nv, dk, dv) float or half, updated in place (rows scan_slots);
+//                    fp16 pools (recurrent_dtype = half, the default since 02446529) convert on
+//                    the load and round RNE once per step on the store; the scan math is fp32
 //   conv_slots / scan_slots: (bsz,) int32 or int64 pool rows
 //   norm_w:        (dv,) float
 //   out:           (bsz, nv * dv) half
