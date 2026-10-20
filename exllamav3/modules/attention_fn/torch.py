@@ -126,7 +126,10 @@ def _torch_paged_gather_sdpa(
     block_size = k_cache.shape[1]
 
     turing = sdpa_prefill(q.device)
-    if not turing:
+    if not turing and q.device.type != "cpu":
+        # The GPU advice (triton/xformers) is meaningless on a CPU-only build, and on CPU the
+        # per-chunk calls below land on torch's AVX-512 flash CPU kernel anyway -- warn only
+        # where a big-head fallback would actually be taken
         _warn_sdpa_fallback()
 
     outputs = []
