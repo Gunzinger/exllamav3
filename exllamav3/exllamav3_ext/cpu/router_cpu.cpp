@@ -3,10 +3,12 @@
 
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "router_cpu.h"
+#include "cpu/moe_mul1.h"
 #include <torch/extension.h>
 #include <c10/util/Half.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <utility>
@@ -46,9 +48,10 @@ ROUTER_TARGET_AVX512 inline void router_logits_row(
     const c10::Half* __restrict__ y,
     const c10::Half* __restrict__ gate,   // (E, K) row-major
     int64_t E, int64_t K,
-    float* __restrict__ l)
+    float* __restrict__ l,
+    int64_t e0, int64_t e1)
 {
-    for (int64_t e = 0; e < E; e += 4)
+    for (int64_t e = e0; e < e1; e += 4)
     {
         const int64_t rows = E - e < 4 ? E - e : 4;
         const c10::Half* g[4] =
@@ -79,6 +82,43 @@ ROUTER_TARGET_AVX512 inline void router_logits_row(
             l[e + r] = _cvtsh_ss(_cvtss_sh(d, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
         }
     }
+}
+
+// M4: logits phase on the moe worker pool (pinned, hot right before the expert phase). Each
+// worker takes a contiguous expert-row chunk of every y row; the per-row math is the serial
+// kernel's unchanged loop, so logits are bit-identical, and the top-k/tie-guard/softmax in
+// router_std_cpu stays the serial code reading the completed l[]
+struct RouterLogitsCtx
+{
+    const c10::Half* y;
+    const c10::Half* gate;
+    int64_t M, E, K;
+    float* l;
+};
+
+void router_logits_pool_fn(void* vctx, int worker, int nw)
+{
+    RouterLogitsCtx& c = *static_cast<RouterLogitsCtx*>(vctx);
+    const int64_t e0 = c.E * worker / nw;
+    const int64_t e1 = c.E * (worker + 1) / nw;
+    if (e0 >= e1) return;
+    for (int64_t mo = 0; mo < c.M; ++mo)
+        router_logits_row(c.y + mo * c.K, c.gate, c.E, c.K, c.l + mo * c.E, e0, e1);
+}
+
+int router_cpu_threads()
+{
+    // 1 = serial. The gate matrix is a once-per-step DRAM stream (~2.5 MB at 512x2560) a single
+    // core streams at ~19 GB/s; an expert-row split on the moe pool measured 148.6/137.3/54.5/
+    // 84.3 us/layer at 1/4/6/8 workers on the bench host, so 6 is the default. Never exceeds
+    // the pool's current size
+    static const int v = [] {
+        int t = 6;
+        const char* e = std::getenv("EXL3_ROUTER_CPU_THREADS");
+        if (e && *e) t = std::atoi(e);
+        return std::max(1, t);
+    }();
+    return v;
 }
 
 } // namespace
@@ -114,10 +154,21 @@ bool router_std_cpu
     int64_t* sel_p = selected_experts.data_ptr<int64_t>();
     c10::Half* w_p = reinterpret_cast<c10::Half*>(routing_weights.data_ptr());
 
-    std::vector<float> l(E);
+    std::vector<float> l((size_t) M * E);
+    const int rt = router_cpu_threads();
+    if (rt > 1)
+    {
+        RouterLogitsCtx rl{y_p, gate_p, M, E, K, l.data()};
+        exl3_moe_cpu_pool_run(&router_logits_pool_fn, &rl, rt);
+    }
+    else
+    {
+        for (int64_t m = 0; m < M; m++)
+            router_logits_row(y_p + m * K, gate_p, E, K, l.data() + m * E, 0, E);
+    }
     for (int64_t m = 0; m < M; m++)
     {
-        router_logits_row(y_p + m * K, gate_p, E, K, l.data());
+        const float* lm = l.data() + m * E;
 
         // Top-k as a best-first sorted insert list (k <= 32, E in L1): a candidate enters only
         // if it beats the current worst; equal values resolve to the lower index.
@@ -126,7 +177,7 @@ bool router_std_cpu
         int n = 0;
         for (int64_t e = 0; e < E; e++)
         {
-            const float v = l[e];
+            const float v = lm[e];
             if (n == TK && !router_rank_above(v, e, tv[TK - 1], ti[TK - 1])) continue;
             int j = n < TK ? n++ : (int) TK - 1;
             tv[j] = v; ti[j] = e;
@@ -151,7 +202,7 @@ bool router_std_cpu
             {
                 bool in = false;
                 for (int j = 0; j < n; j++) if (ti[j] == e) { in = true; break; }
-                if (!in && l[e] > bnd) bnd = l[e];
+                if (!in && lm[e] > bnd) bnd = lm[e];
             }
             if (bnd == tv[TK - 1]) tied = true;
         }
