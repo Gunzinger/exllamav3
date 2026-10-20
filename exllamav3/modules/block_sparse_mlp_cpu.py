@@ -9,6 +9,11 @@ from .block_sparse_mlp_routing import _routing_buffers, routing_std
 # routing type; EXL3_ROUTER_CPP=0 restores the torch path for A/B testing
 _router_cpp = os.environ.get("EXL3_ROUTER_CPP", "1") != "0"
 
+# T1 fused shared-expert tail (ext.exl3_moe_cpu_forward_gated): shared-expert GEMVs, shared-gate
+# GEMV, sigmoid, mul-add and the out_dtype cast in one call; EXL3_MOE_GATE_FUSED=0 restores the
+# torch epilogue for A/B testing
+_gate_fused = os.environ.get("EXL3_MOE_GATE_FUSED", "1") != "0"
+
 def _routing_std_cpu(bsz, cfg, y, params):
     """Fast path through ext.router_std_cpu (fp16 GEMV with fp32 accumulation rounded to half
     logits, top-k with torch's tie order, softmax over the selection), mirroring routing_std's
@@ -438,6 +443,7 @@ class BlockSparseMLP_CPU:
         self.cpu_shared_handle = None
         self._cpu_shared_sel = None
         self._cpu_shared_w = None
+        self._cpu_gate_w = None
         self.cpu_threads = 0
         # Packed-trellis upgrade marker: the registrations above hold native-layout bytes
         # (the deferred loader fills tensors after the module epilogue, so they cannot be
@@ -551,6 +557,27 @@ class BlockSparseMLP_CPU:
             experts = ([self.gates] if self.gated else []) + [self.ups, self.downs]
             upgrade([l for ls in experts for l in ls], self._register_routed)
 
+    def _shared_gate_statics(self):
+        """Weights of the shared gate in the form the fused epilogue entry reads (the fp32 gate
+        column of the at::matmul the fp16 Linear's CPU path computes). Built on first use, None
+        when the gate doesn't fit the fused path's formats and the caller keeps the torch
+        epilogue (exactly shared_gate.forward's own operands, so g stays bit-identical)."""
+        s = getattr(self, "_cpu_gate_w", None)
+        if s is not None:
+            return s
+        gl = self.shared_gate
+        inner = gl.inner
+        if (
+            gl.quant_type != "fp16" or
+            inner.weight.dtype != torch.half or not inner.weight.is_contiguous() or
+            inner.weight.device.type != "cpu" or tuple(inner.weight.shape) != (self.hidden_size, 1) or
+            inner.bias is not None or gl.lora_a_tensors or
+            gl.pre_scale != 1.0 or gl.post_scale != 1.0 or gl.softcap != 0.0
+        ):
+            return None
+        self._cpu_gate_w = s = {"w": inner.weight.float()}
+        return s
+
     def _register_routed(self):
         """(Re-)register the routed experts with the in-process moe_mul1 kernel."""
         act = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}[self.activation_fn]
@@ -638,6 +665,7 @@ class BlockSparseMLP_CPU:
             final_hidden_states = self.routed_post_norm.forward(final_hidden_states, params)
 
         if self.shared_experts is not None:
+            fused = False
             if self.cpu_shared_handle is not None:
                 sh_in = x.reshape(-1, self.hidden_size)
                 if not sh_in.is_contiguous():
@@ -648,17 +676,30 @@ class BlockSparseMLP_CPU:
                 if sel is None or sel.shape[0] != bsz:
                     self._cpu_shared_sel = sel = torch.zeros((bsz, 1), dtype = torch.long)
                     self._cpu_shared_w = torch.ones((bsz, 1), dtype = torch.half)
-                sh = torch.empty((bsz, self.hidden_size), dtype = torch.float)
-                ext.exl3_moe_cpu_forward(self.cpu_shared_handle, sh_in, sel, self._cpu_shared_w, sh, self.cpu_threads)
+                gs = self._shared_gate_statics() if self.shared_gate is not None else None
+                if (_gate_fused and x.device.type == "cpu"
+                        and gs is not None and self.shared_experts_post_norm is None
+                        and out_dtype in (None, torch.half, torch.float)
+                        and final_hidden_states.is_contiguous()
+                        and ext.exl3_moe_cpu_has_avx512_bw()):
+                    final_hidden_states = ext.exl3_moe_cpu_forward_gated(
+                        self.cpu_shared_handle, sh_in, sel, self._cpu_shared_w,
+                        final_hidden_states, gs["w"], self.cpu_threads,
+                        out_dtype == torch.half)
+                    fused = True
+                else:
+                    sh = torch.empty((bsz, self.hidden_size), dtype = torch.float)
+                    ext.exl3_moe_cpu_forward(self.cpu_shared_handle, sh_in, sel, self._cpu_shared_w, sh, self.cpu_threads)
             else:
                 sh = self.shared_experts.forward(x, params)
-            if self.shared_experts_post_norm is not None:
-                sh = self.shared_experts_post_norm.forward(sh, params)
-            if self.shared_gate is not None:
-                g = self.shared_gate.forward(x, params)
-                final_hidden_states += sh.view(bsz, -1) * torch.sigmoid(g.view(bsz, 1))
-            else:
-                final_hidden_states += sh.view(bsz, -1)
+            if not fused:
+                if self.shared_experts_post_norm is not None:
+                    sh = self.shared_experts_post_norm.forward(sh, params)
+                if self.shared_gate is not None:
+                    g = self.shared_gate.forward(x, params)
+                    final_hidden_states += sh.view(bsz, -1) * torch.sigmoid(g.view(bsz, 1))
+                else:
+                    final_hidden_states += sh.view(bsz, -1)
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)

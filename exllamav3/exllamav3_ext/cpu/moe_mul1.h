@@ -88,6 +88,29 @@ void exl3_moe_cpu_forward
     int64_t num_threads
 );
 
+// Shared-expert tail of the CPU MoE forward in one dispatch (block_sparse_mlp_cpu.py): the shared
+// expert GEMVs (same computation as exl3_moe_cpu_forward), the shared-gate GEMV (the same fp32
+// at::matmul the fp16 Linear's CPU path takes, so g is bit-identical), sigmoid, mul-add into the
+// routed sum and the out-dtype cast. The sigmoid mirrors ATen's fp32 kernel split (scalar libm
+// below 32 rows and on the tail, Sleef u10 vectorized on 32-element super-chunks), so the host
+// must have AVX-512 (exl3_moe_cpu_has_avx512_bw); callers gate on it.
+//   x, selected, weights: as exl3_moe_cpu_forward (top_k is 1 on the shared-expert call)
+//   routed:    [m, hidden] fp32, contiguous, read but not written
+//   gate_w:    [hidden, 1] fp32, contiguous, pre-cast gate column
+//   half_out:  return a new [m, hidden] half tensor (the fused out_dtype cast); false returns
+//              routed itself
+at::Tensor exl3_moe_cpu_forward_gated
+(
+    int64_t handle,
+    const at::Tensor& x,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& routed,
+    const at::Tensor& gate_w,
+    int64_t num_threads,
+    bool half_out
+);
+
 // Raw-pointer variant used by the persistent worker (moe_handoff.cu): same computation as
 // exl3_moe_cpu_forward, expert selection as int32, buffers caller-owned
 void exl3_moe_cpu_forward_raw
