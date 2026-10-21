@@ -262,13 +262,13 @@ class Embedding(Module):
             # device layer; staging it through a reused pinned buffer makes that upload
             # asynchronous. Only callers that guarantee a sync point between forward passes
             # (the generator's decode loop) may set the pinned_staging flag.
-            if params.get("pinned_staging") and x.device.type == "cpu":
+            if params.get("pinned_staging") and x.device.type == "cpu" and torch.cuda.is_available():
                 key = (x.shape, x.dtype)
                 buf = self._pinned_staging.get(key)
                 if buf is None:
                     if len(self._pinned_staging) > 8:
                         self._pinned_staging.clear()
-                    buf = torch.empty_like(x, pin_memory = True)
+                    buf = torch.empty_like(x, pin_memory = torch.cuda.is_available())
                     self._pinned_staging[key] = buf
                 buf.copy_(x)
                 x = buf

@@ -2,47 +2,61 @@ import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from .bighead_scalar import fn_bighead_scalar_attn
-from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
+from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache, fn_torch_sdpa_cpu_paged
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
-from .triton_paged import (
-    _qc_staging,
-    fn_triton_paged_attn,
-    fn_triton_paged_attn_longq,
-    fn_triton_paged_attn_decode,
-    fn_triton_paged_attn_prefill,
-    fn_triton_varlen_attn,
-    fn_triton_paged_attn_decode_qc,
-    fn_triton_paged_attn_prefill_qc,
-    fn_triton_attn_nocache,
-)
+try:
+    from .triton_paged import (
+        _qc_staging,
+        fn_triton_paged_attn,
+        fn_triton_paged_attn_longq,
+        fn_triton_paged_attn_decode,
+        fn_triton_paged_attn_prefill,
+        fn_triton_varlen_attn,
+        fn_triton_paged_attn_decode_qc,
+        fn_triton_paged_attn_prefill_qc,
+        fn_triton_attn_nocache,
+    )
+except ModuleNotFoundError:
+    # Hosts without triton (CPU-only builds): the Triton kernels are GPU-only anyway, so dispatch
+    # falls through to the torch fallbacks, and quant-direct attention (which only the Triton path
+    # serves) is disabled
+    _qc_staging = 2
+    _fns_triton_fast: list[AttnFn] = []
+    _fns_qc: list[AttnFn] = []
+    _fns_triton_legacy: list[AttnFn] = []
+else:
+    # Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
+    # serve every shape they support (any head_dim <= 512, zero-padded to a power of two), then the
+    # older Triton kernels and the torch/xformers fallbacks for the rest
+    _fns_triton_fast: list[AttnFn] = [
+        fn_triton_paged_attn_decode,
+        fn_triton_paged_attn_prefill,
+        fn_triton_varlen_attn,
+    ]
 
-# Candidate attn functions in order of preference: the Triton decode/prefill/varlen kernels
-# serve every shape they support (any head_dim <= 512, zero-padded to a power of two), then the
-# older Triton kernels and the torch/xformers fallbacks for the rest
-_fns_triton_fast: list[AttnFn] = [
-    fn_triton_paged_attn_decode,
-    fn_triton_paged_attn_prefill,
-    fn_triton_varlen_attn,
-]
+    # Quant-direct calls carry the packed cache in q_cache and leave k_cache/v_cache as None, which makes them
+    # indistinguishable from cache-less attention to any backend that only checks has_kv_cache(). Such a backend
+    # would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
+    # ever dispatch over the qc-aware functions
+    _fns_qc: list[AttnFn] = [
+        fn_triton_paged_attn_decode_qc,
+        fn_triton_paged_attn_prefill_qc,
+    ]
 
-# Quant-direct calls carry the packed cache in q_cache and leave k_cache/v_cache as None, which makes them
-# indistinguishable from cache-less attention to any backend that only checks has_kv_cache(). Such a backend
-# would silently attend over just the new K/V rows and ignore the cached context, so quant-direct calls only
-# ever dispatch over the qc-aware functions
-_fns_qc: list[AttnFn] = [
-    fn_triton_paged_attn_decode_qc,
-    fn_triton_paged_attn_prefill_qc,
-]
+    _fns_triton_legacy: list[AttnFn] = [
+        fn_triton_attn_nocache,
+        fn_triton_paged_attn,
+        fn_triton_paged_attn_longq,
+    ]
 
 # Quantized caches feed the attention kernels directly (online dequant or prefill staging by
 # EXL3_QC_STAGING level, see triton_paged); level 2 restores the dequantize-then-attend path
 # with full-size fp16 temporaries for A/B testing
 _qc_attn = _qc_staging < 2
 
-attn_fns: list[AttnFn] = _fns_triton_fast + [
-    fn_triton_attn_nocache,
-    fn_triton_paged_attn,
-    fn_triton_paged_attn_longq,
+# The CPU paged-cache fn leads the list: it declines non-CPU tensors, so CUDA/HIP dispatch is
+# unchanged, while a CPU-only load resolves here instead of falling off the end of the list
+attn_fns: list[AttnFn] = [fn_torch_sdpa_cpu_paged] + _fns_triton_fast + _fns_triton_legacy + [
     fn_bighead_scalar_attn,
     fn_xformers_cutlass_fallback_cache,
     fn_xformers_cutlass_fallback_nocache,

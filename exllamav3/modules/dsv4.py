@@ -15,7 +15,10 @@ from ..util.tensor import g_tensor_cache, get_for_device
 from .quant.exl3 import LinearEXL3
 from ..cache.dsa import DSV4LayerState, CacheLayer_dsa
 from .multilinear import MultiLinear
-from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
+try:
+    from .attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores, dsa_debug_bounds
+except ModuleNotFoundError:
+    dsa_attn = dsa_indexer_scores = dsa_debug_bounds = None
 from .attention_fn.bc_dsa import bc_dsa_enable, build_bc_dsa, build_bc_dsa_batch
 
 # Multi-job decode via the batched path: one projection pass, one MULTIROW attention

@@ -34,6 +34,13 @@ def clamp(n, smallest, largest):
 def conditional(condition, a, b):
     return a if condition else b
 
+_cpu_sample_generator = None
+def _cpu_sample_rng() -> torch.Generator:
+    global _cpu_sample_generator
+    if _cpu_sample_generator is None:
+        _cpu_sample_generator = torch.Generator(device = "cpu")
+    return _cpu_sample_generator
+
 @dataclass
 class SamplingState:
     rand_u32: int
@@ -114,6 +121,9 @@ class SS_Sample(SS_Base):
     Final sampling step: categorical sampling, randomly sample from (truncated and/or modified) distribution
     """
     def run(self, state: SamplingState):
+        if state.in_logits.device.type != "cuda":
+            self.run_torch(state)
+            return
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits)
@@ -132,6 +142,35 @@ class SS_Sample(SS_Base):
             case SS.PROBS_S | SS.PROBS_N_S:
                 ext.gumbel_noise_log(state.probs, state.probs, state.rand_u32)
                 temp = torch.argmax(state.probs, dim = -1)
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
+        state.state = SS.DONE
+
+    def run_torch(self, state: SamplingState):
+        """CPU fallback for the gumbel-max kernels (no CPU build binds them): exponential race
+        argmax(x - E) with E = -log(U) ~ Exp(1), distributionally the gumbel-max draw the CUDA
+        path computes. Torch-only ops; seeded from the per-step rand_u32 like curand_init"""
+        gen = _cpu_sample_rng()
+        gen.manual_seed(state.rand_u32 & 0x7fffffff)
+
+        def exp_race(x):
+            u = torch.rand(x.shape, dtype = torch.float, device = x.device, generator = gen)
+            u.clamp_(1e-20, 1.0).log_().neg_()
+            x -= u
+            return x
+
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.float()
+                state.sample = torch.argmax(exp_race(state.logits), dim = -1)
+            case SS.LOGITS:
+                state.sample = torch.argmax(exp_race(state.logits), dim = -1)
+            case SS.PROBS | SS.PROBS_N:
+                state.sample = torch.argmax(exp_race(state.probs.log_()), dim = -1)
+            case SS.LOGITS_S:
+                temp = torch.argmax(exp_race(state.logits), dim = -1)
+                state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
+            case SS.PROBS_S | SS.PROBS_N_S:
+                temp = torch.argmax(exp_race(state.probs.log_()), dim = -1)
                 state.sample = state.indices[buffered_arange(state.bsz, state.in_logits.device), temp]
         state.state = SS.DONE
 
@@ -257,7 +296,7 @@ class SS_Fused(SS_Base):
 
         state.sample = state.empty_sample()
         mask_is_bits = state.fused_mask is not None and state.fused_mask.dtype == torch.int32
-        ext.fused_sampler(
+        args = (
             logits,
             None if mask_is_bits else state.fused_mask,
             state.fused_mask if mask_is_bits else None,
@@ -274,6 +313,10 @@ class SS_Fused(SS_Base):
             self.inv_temp_filter,
             histogram,
         )
+        if logits.device.type != "cuda":
+            ext.fused_sampler_cpu(*args)
+        else:
+            ext.fused_sampler(*args)
         state.state = SS.DONE
 
 

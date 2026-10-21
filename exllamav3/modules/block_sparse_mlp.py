@@ -10,6 +10,7 @@ from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
+from ..util import activation as act_mul
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .rmsnorm import RMSNorm
@@ -408,16 +409,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.gateless_act = None
             match activation_fn:
                 case "silu":
-                    self.activation_fn_call = ext.silu_mul
+                    self.activation_fn_call = act_mul.silu_mul
                     self.activation_fn_idx = 0
                 case "gelu":
-                    self.activation_fn_call = ext.gelu_mul
+                    self.activation_fn_call = act_mul.gelu_mul
                     self.activation_fn_idx = 1
                 case "swiglu_oai":
-                    self.activation_fn_call = ext.silu_oai_mul
+                    self.activation_fn_call = act_mul.silu_oai_mul
                     self.activation_fn_idx = 3
                 case "relu2":
-                    self.activation_fn_call = ext.relu2_mul
+                    self.activation_fn_call = act_mul.relu2_mul
                     self.activation_fn_idx = 2
                 case _:
                     raise ValueError(f"Unknown activation function {activation_fn}")
@@ -425,7 +426,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # Gateless relu2 rides the gated fast paths via relu(u) * u = relu2(u): the act call
             # sites pass (u, u, a) and the fused MoE kernel's MOE_ACT_RELU2_NOGATE synthesizes
             # the gate lane from u
-            self.activation_fn_call = ext.relu_mul if activation_fn == "relu2" else None
+            self.activation_fn_call = act_mul.relu_mul if activation_fn == "relu2" else None
             self.activation_fn_idx = 2 if activation_fn == "relu2" else -1
             match activation_fn:
                 case "silu": self.gateless_act = F.silu
@@ -839,6 +840,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.cpu_post_load()
             self.load_local(**kwargs)
             self.load_routing(**kwargs)
+        elif device is not None and torch.device(device).type == "cpu":
+            # CPU-only device path (plan A3): no BC/graph/fused machinery, the in-process
+            # moe_mul1 expert kernel registered by load_local_cpu instead
+            self.load_local_cpu(**kwargs)
+            self.load_routing(**kwargs)
 
 
     def _batch_recon_layer(self, y):
@@ -1010,6 +1016,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        if self.cpu_layer:
+            return self.cpu_forward(x, params, out_dtype)
 
         if self.alt_residual_channel:
             y = params["residual"].view(-1, self.hidden_size)

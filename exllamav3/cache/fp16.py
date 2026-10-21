@@ -73,6 +73,17 @@ class CacheLayer_fp16(CacheLayer):
         v: torch.Tensor,
         length: int
     ):
+        if self.k is not None and self.k.device.type == "cpu":
+            # paged_kv_cache_update in torch: rows land at cache_seqlens[b] + s, mapped through
+            # the block table (pages are disjoint per row, the scatter is race-free)
+            page_size = self.k.shape[1]
+            pos = cache_seqlens.long().unsqueeze(1) + torch.arange(length)
+            phys = block_table.long().gather(1, pos // page_size) * page_size + pos % page_size
+            kf = self.k.view(self.k.shape[0] * page_size, *self.k.shape[2:])
+            vf = self.v.view(self.v.shape[0] * page_size, *self.v.shape[2:])
+            kf[phys.flatten()] = k.reshape(-1, *self.k.shape[2:])
+            vf[phys.flatten()] = v.reshape(-1, *self.v.shape[2:])
+            return
         ext.paged_kv_cache_update(k, v, self.k, self.v, block_table, cache_seqlens)
 
 

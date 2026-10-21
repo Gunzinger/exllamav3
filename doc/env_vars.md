@@ -1086,3 +1086,72 @@ Forces the quantizer's dense trellis specializations (`quantize_tiles_optimized.
 off (`0`) regardless of the per-architecture dispatch (on for every K on sm_120; per K and codebook
 on Ada and Ampere where measured faster; the original kernels elsewhere). For experiments only: the
 choice also sizes the quantizer's scratch buffers.
+
+## CPU-only build (fork: Gunzinger/exllamav3, branch cpu-only)
+
+The fork adds a full CPU/AVX-512 inference path, device-gated behind `device.type == "cpu"`, on top
+of upstream master. Every fork-owned knob lives in the `EXL3_CPU_*` namespace so fork knobs stay
+clearly distinct from upstream knobs; upstream-owned names are never renamed, even where fork
+tooling sets them. In particular, `EXL3_MOE_CPU_THREADS` and `EXL3_MOE_CPU_PIN` are upstream-owned
+shared CPU-MoE pool configuration (the `moe_cpu_host` worker process) that the fork's in-process
+CPU path also honors for its pool sizing/placement — hybrid arms run the upstream CPU-MoE worker
+and the fork's in-process pool side by side, so both must read the same values.
+
+Unless noted, `0` disables and any other value enables (or the numeric value is taken directly);
+C++-side variables are read once on first use and cached, Python-side ones at import time.
+
+### Model / load
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_CPU_TEXT_ONLY` | `0` | Skip the vision tower of vision checkpoints entirely on load (its modules are CUDA-bound; used by the CPU-only trial's text-only conversions). |
+| `EXL3_CPU_THP` | `1` (POSIX) | `madvise` 2 MiB transparent huge pages for the CPU-resident weight trellis (TLB reach on the GEMV streams); best effort. |
+| `EXL3_CPU_MTP` | `1` | Kill-switch for MTP speculative decoding (`--mtp` reuses the model as its own draft); `0` disables the MTP head even when requested. |
+| `EXL3_CPU_DEBUG_JOB` | unset | Print the traceback of a failed generator job before it is reaped, instead of only the error message. |
+
+### Linear / MoE kernels
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_CPU_LINEAR_THREADS` | `EXL3_MOE_CPU_THREADS` / physical cores | Thread count for the linear (lm_head-class) decode GEMV kernels. |
+| `EXL3_CPU_MOE_GATE_FUSED` | `1` | Fused shared-expert tail (`exl3_moe_cpu_forward_gated`): shared-expert GEMVs, shared-gate GEMV, sigmoid, mul-add and the output cast in one C++ call; `0` restores the torch epilogue. |
+| `EXL3_CPU_MOE_FUTEX` | `1` | Park the in-process MoE compute pool on a futex instead of a 50 µs sleep poll (the poll costs ~1.6 W of serving-idle package power); `0` restores the sleep poll. |
+| `EXL3_CPU_MUL1_PRF` | tuned (one T1 line, one k-row ahead) | Prefetch sweep knob for the band-8 swizzled weight stream: `"<hint>:<bytes>[:<lines>]"`, hint `t0/t1/t2/nta`. Timing only — every setting is bit-identical. |
+
+### Router
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_CPU_ROUTER_CPP` | `1` | Fused CPU router (`router_std_cpu`): one AVX-512 C++ call per layer for the "std" routing type; `0` restores the torch path. |
+| `EXL3_CPU_ROUTER_THREADS` | `6` | Worker count of the router kernel's spin-parked pool; `1` runs it serially. |
+
+### Attention / linear-attention layers
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_CPU_SDPA_PAGED` | `1` | Fused paged SDPA (`sdpa_paged_cpu`): reads the KV pages in place with no gather (AVX-512 probe required; class-relaxed numerics, accepted on KL evidence); `0` restores the torch gather path. |
+| `EXL3_CPU_SDPA_THREADS` | `6` | Worker count of the paged-SDPA kernel's spin-parked pool; `1` runs it serially. |
+| `EXL3_CPU_GDN_STEP` | `1` | Fused CPU decode step for gated-delta-net layers (`gdn_step_cpu`); `0` falls back to the torch chain for A/B testing. |
+| `EXL3_CPU_GDN_THREADS` | `0` (kernel default: 1) | Worker count of the fused decode step's pool; `0` leaves the kernel's own default. |
+| `EXL3_CPU_GDN_CHUNK_SCAN` | `0` | Opt in to the fused CPU prefill pass (`gdn_chunk_scan_cpu`, the WY chunk-scan kernel). Default off: measured slower than the torch chunk path at real-class numerics; unit parity rows are kept for a future pass. |
+| `EXL3_CPU_GDN_SCAN_THREADS` | `0` (kernel default: 4) | Worker count of the chunk-scan pool; `0` leaves the kernel's own default. |
+| `EXL3_CPU_GDN_CHUNK_SCAN_BARRIERS` | `0` | `1` restores the legacy two-barrier schedule of the chunk-scan kernel (default is the head-partitioned barrier-free pipeline), for A/B testing. |
+| `EXL3_CPU_PLE_STEP` | `0` | Opt in to the fused AVX-512 PLE decode step (`ple_step_cpu`, ~2 ms/step saved). Default off keeps greedy decode bit-identical: the fused rounding is a real (small) class change. |
+
+### Hyper-connections
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_CPU_HC_BF16` | `1` | Keep the hyper-connection `proj`/`up` tables as a lazy bf16 CPU cache instead of fp16; `0` restores the fp16 tables. |
+| `EXL3_CPU_HC_APPLY` | `1` | Site residual update (`apply_`'s CPU branch) as one C++ elementwise dispatch instead of five torch ops, bit-equal on both x dtypes; `0` restores the torch path. |
+| `EXL3_CPU_HC_MIX_THREADS` | quarter of logical CPUs | Worker count of the `hc_mix_cpu` kernel's spin-parked pool (the bursts stop scaling past ~6 workers). |
+| `EXL3_CPU_HC_MIX_ADAPT` | `1` | Cap the mix pool at one worker when joins stay over 4 ms (a busy host makes extra workers counterproductive); `0` disables the cap. |
+| `EXL3_CPU_HC_PRF_DIST` | `0` (off) | Software-prefetch distance (bytes ahead) in the mix kernel's table walk. Memory hint only: bit-identical at any value. |
+
+### Measurement tooling only (read by the cpu-trial scripts, not the library)
+
+| Variable | Default | Description |
+|---|---|---|
+| `EXL3_CPU_RAPL_HELPER` | `/usr/local/bin/rapl-read` | Path of the capability-scoped RAPL read helper used by `bench_decode.py --energy`. |
+| `EXL3_CPU_RYZEN_INFO` | `/usr/local/bin/ryzen-info` | Path of the ryzenadj SMU info helper used by `bench_decode.py --energy` and `check-energy.sh`. |
+| `EXL3_CPU_ENERGY_UNCORE` | `1` | `0` disables the `uncore_win.py` DRAM-traffic attachment of an `--energy` run. |

@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 import os
 import sys
 from .util.arch_list import maybe_set_arch_list_env
-from .util.cuda_flags import cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
+from .util.cuda_flags import cpu_compat_include_dir, cpu_extension_sources, cuda_cflags, extension_sources, hip_include_flags, patch_hip_ninja_file_writer, use_rocm_sdk_devel
 
 extension_name = "exllamav3_ext"
 verbose = False  # Print wall of text when compiling
@@ -15,6 +15,12 @@ ext_debug = False  # Compile with debug options
 # Determine if we're on Windows
 
 windows = (os.name == "nt")
+
+# CPU-only build: a torch without CUDA/HIP runtimes (or EXLLAMA_FORCE_CPU) builds a reduced,
+# pure-C++ extension (cpu_extension_sources + bindings_cpu.cpp); no nvcc/hipcc, CUDA_HOME or
+# visible GPU is involved
+
+cpu_only = (torch.version.cuda is None and torch.version.hip is None) or bool(os.environ.get("EXLLAMA_FORCE_CPU"))
 
 # Determine if extension is already installed or needs to be built
 
@@ -27,8 +33,37 @@ def is_precompiled_extension_available():
         for suffix in importlib.machinery.EXTENSION_SUFFIXES
     )
 
-if is_precompiled_extension_available():
+# A CPU-only torch must never import a prebuilt exllamav3_ext that may sit at the repo root of
+# the unified tree: that .so is a CUDA/HIP build (ROCm ABI) and fails to load under CPU torch.
+# CPU-only always JIT-builds the reduced pure-C++ extension (TORCH_EXTENSIONS_DIR cache).
+if is_precompiled_extension_available() and not cpu_only:
     import exllamav3_ext
+elif cpu_only:
+
+    # -O3, not -Ofast: like the ROCm branch below, fast-math is left off; the CPU kernels are
+    # integer/exact math where it would only risk surprises
+    extra_cflags = ["-O3"]
+    if ext_debug:
+        extra_cflags += ["-g"]
+
+    library_dir = os.path.dirname(os.path.abspath(__file__))
+    sources_dir = os.path.join(library_dir, extension_name)
+
+    exllamav3_ext = load(
+        name = extension_name,
+        sources = cpu_extension_sources(sources_dir),
+        extra_include_paths = [sources_dir, cpu_compat_include_dir(sources_dir)],
+        verbose = verbose,
+        extra_ldflags = [],
+        extra_cuda_cflags = [],
+        extra_cflags = extra_cflags
+    )
+
+    # torch's load() does not register the module in sys.modules; do it here so a subsequent
+    # bare "import exllamav3_ext" resolves the JIT-built CPU module instead of searching
+    # sys.path — where the unified tree's repo root exposes the HIP-built root .so to any
+    # venv whose editable install puts it there
+    sys.modules[extension_name] = exllamav3_ext
 else:
 
     # Kludge to get compilation working on Windows
