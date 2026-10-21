@@ -33,7 +33,10 @@ def is_precompiled_extension_available():
         for suffix in importlib.machinery.EXTENSION_SUFFIXES
     )
 
-if is_precompiled_extension_available():
+# A CPU-only torch must never import a prebuilt exllamav3_ext that may sit at the repo root of
+# the unified tree: that .so is a CUDA/HIP build (ROCm ABI) and fails to load under CPU torch.
+# CPU-only always JIT-builds the reduced pure-C++ extension (TORCH_EXTENSIONS_DIR cache).
+if is_precompiled_extension_available() and not cpu_only:
     import exllamav3_ext
 elif cpu_only:
 
