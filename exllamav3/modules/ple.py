@@ -126,7 +126,7 @@ _ple_sub_range = int(os.environ.get("EXL3_PLE_SUB_CHUNK", "1024"))
 
 # Fused AVX-512 decode-step kernel (cpu/ple_step_cpu.cpp): one ext call for the whole
 # forward_streams_cpu math. Probed once at import (the raising ext stub of the A4 fallback
-# tests keeps every CPU decode on the torch path there); EXL3_PLE_STEP=0 falls back too
+# tests keeps every CPU decode on the torch path there); EXL3_CPU_PLE_STEP=0 falls back too
 _ple_step_cpu = False
 try:
     _ple_step_cpu = hasattr(ext, "ple_step_cpu") and bool(ext.ple_step_cpu_has_avx512())
@@ -139,8 +139,8 @@ except Exception:
 # boundary; the PLE delta feeds the residual every decode step and that compounding is visible
 # e2e (self-golden: med 16/16 exact, long 10/16 with a 1.1-logit-gap first flip at step 10 and
 # a divergent tail -- a real class change, not coin-flips). Default off keeps greedy decode
-# bit-identical; EXL3_PLE_STEP=1 opts into the ~2 ms/step
-_ple_step_enable = os.environ.get("EXL3_PLE_STEP", "0") == "1"
+# bit-identical; EXL3_CPU_PLE_STEP=1 opts into the ~2 ms/step
+_ple_step_enable = os.environ.get("EXL3_CPU_PLE_STEP", "0") == "1"
 
 
 class PLELayer(Module):

@@ -21,13 +21,13 @@
 // see the Pool note in the source) with one in-function barrier; workers are spawned with the
 // process's load-time affinity mask (they would otherwise inherit the moe/linear pool's pinned
 // caller and share its one core with the master), and joins that stay over 4 ms cap the pool at
-// one worker (EXL3_HC_MIX_CPU_ADAPT=0 disables). Threads = EXL3_HC_MIX_CPU_THREADS, else a
+// one worker (EXL3_CPU_HC_MIX_ADAPT=0 disables). Threads = EXL3_CPU_HC_MIX_THREADS, else a
 // quarter of the logical CPU count (the bursts stop scaling
 // well past ~6 workers). Requires AVX-512F/BW/VL + FMA + F16C (gr_mix_cpu_has_avx512); callers
 // fall back to _mix_ref when it reports false or the tensors are ineligible.
 //   streams: (R, H, D) float, CPU, contiguous, H = 4, R in [1, 8]
 //   fn:      (M, H * D) half, or bfloat16 (dispatch on dtype: same math, fp32 accumulation;
-//            bf16 tables halve the per-call table stream, python-side EXL3_HC_BF16 repack),
+//            bf16 tables halve the per-call table stream, python-side EXL3_CPU_HC_BF16 repack),
 //            M = LR + (post ? H : 0)
 //   up:      (H * D, LR) same dtype as fn, checkpoint orientation (not the CUDA kernel's repacked upt)
 //   w:       (H * D) float norm weight (incl +1)

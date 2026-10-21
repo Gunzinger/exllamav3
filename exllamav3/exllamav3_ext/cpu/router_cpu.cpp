@@ -114,7 +114,7 @@ int router_cpu_threads()
     // the pool's current size
     static const int v = [] {
         int t = 6;
-        const char* e = std::getenv("EXL3_ROUTER_CPU_THREADS");
+        const char* e = std::getenv("EXL3_CPU_ROUTER_THREADS");
         if (e && *e) t = std::atoi(e);
         return std::max(1, t);
     }();

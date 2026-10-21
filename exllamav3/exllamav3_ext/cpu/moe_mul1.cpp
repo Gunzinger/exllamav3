@@ -124,7 +124,7 @@ inline float mul1_k_inv()
     return v;
 }
 
-// EXL3_MUL1_PRF="<hint>:<bytes>[:<lines>]": prefetch sweep knob for the band-8 swizzled
+// EXL3_CPU_MUL1_PRF="<hint>:<bytes>[:<lines>]": prefetch sweep knob for the band-8 swizzled
 // weight stream (the lm_head-class decode GEMV, C3). hint t0/t1/t2/nta, byte distance ahead
 // of the stream pointer, optional line count (default 2 = one iteration's consumption).
 // Unset = the tuned default (single T1 line one k-row step ahead). Prefetches only affect
@@ -134,7 +134,7 @@ inline const Mul1Prf& mul1_prf()
 {
     static const Mul1Prf c = []{
         Mul1Prf r{false, _MM_HINT_T1, 0, 2};
-        if (const char* e = std::getenv("EXL3_MUL1_PRF"))
+        if (const char* e = std::getenv("EXL3_CPU_MUL1_PRF"))
         {
             char hint[8] = {};
             int bytes = 0, lines = 2;
@@ -2414,7 +2414,7 @@ inline bool pin_threads_enabled()
 inline bool pool_futex_enabled()
 {
     static const bool v = [] {
-        const char* e = std::getenv("EXL3_MOE_POOL_FUTEX");
+        const char* e = std::getenv("EXL3_CPU_MOE_FUTEX");
         return !(e && *e == '0');
     }();
     return v;

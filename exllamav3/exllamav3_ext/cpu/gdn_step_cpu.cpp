@@ -121,10 +121,10 @@ inline int gdn_step_cpu_threads()
 {
     // Explicit env, else single-threaded: the step runs 36x per token between the moe pool's
     // bursts, and waking parked workers under the moe pool + system load measured far worse
-    // than the single-threaded sweep (EXL3_GDN_STEP_CPU_THREADS=2+: 2.6 tok/s vs 7.0)
+    // than the single-threaded sweep (EXL3_CPU_GDN_THREADS=2+: 2.6 tok/s vs 7.0)
     static const int v = [] {
         int t = 0;
-        const char* e = std::getenv("EXL3_GDN_STEP_CPU_THREADS");
+        const char* e = std::getenv("EXL3_CPU_GDN_THREADS");
         if (e) t = std::atoi(e);
         if (t <= 0)
             t = 1;
@@ -136,10 +136,10 @@ inline int gdn_step_cpu_threads()
 inline int gdn_chunk_scan_threads()
 {
     // Prefill-sized work (the scan is ~5 MFLOP per chunk per head); a small fixed pool keeps
-    // the phase barriers tight (EXL3_GDN_CHUNK_SCAN_THREADS)
+    // the phase barriers tight (EXL3_CPU_GDN_SCAN_THREADS)
     static const int v = [] {
         int t = 0;
-        const char* e = std::getenv("EXL3_GDN_CHUNK_SCAN_THREADS");
+        const char* e = std::getenv("EXL3_CPU_GDN_SCAN_THREADS");
         if (e) t = std::atoi(e);
         if (t <= 0)
             t = 4;
@@ -151,7 +151,7 @@ inline int gdn_chunk_scan_threads()
 inline int gdn_chunk_scan_barriers()
 {
     static const int v = [] {
-        const char* e = std::getenv("EXL3_GDN_CHUNK_SCAN_BARRIERS");
+        const char* e = std::getenv("EXL3_CPU_GDN_CHUNK_SCAN_BARRIERS");
         return (e && std::atoi(e) != 0) ? 1 : 0;
     }();
     return v;
@@ -1108,7 +1108,7 @@ static inline void gdn_chunk_head_range(const GdnCtx& c, int worker, int nw, int
 }
 
 // gates | conv, then the chunk scan (q/k l2norm in-chunk), then the norm epilogue;
-// default head-partitioned barrier-free, EXL3_GDN_CHUNK_SCAN_BARRIERS=1 restores the
+// default head-partitioned barrier-free, EXL3_CPU_GDN_CHUNK_SCAN_BARRIERS=1 restores the
 // two-barrier phase schedule with the plain head/channel partitions
 static void gdn_chunk_pool_fn(void* vctx, int worker, int nw)
 {

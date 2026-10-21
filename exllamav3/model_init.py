@@ -211,7 +211,7 @@ def init(
     draft_model_dir = args.draft_model_dir if return_draft else None
     if "mtp" in args:
         assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
-        if args.mtp and os.environ.get("EXL3_MTP", "1") != "0":
+        if args.mtp and os.environ.get("EXL3_CPU_MTP", "1") != "0":
             args.draft_model_dir = draft_model_dir = args.model_dir
         use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
     else:

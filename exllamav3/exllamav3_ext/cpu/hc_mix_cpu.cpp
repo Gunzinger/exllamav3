@@ -135,7 +135,7 @@ struct Pool
         num_workers = n;
         n_eff = std::min(n_eff, n);
         static const bool adapt_v = [] {
-            const char* e = std::getenv("EXL3_HC_MIX_CPU_ADAPT");
+            const char* e = std::getenv("EXL3_CPU_HC_MIX_ADAPT");
             return !(e && *e == '0');
         }();
         adapt_cap = adapt_v;
@@ -164,7 +164,7 @@ struct Pool
         // broken one (workers confined to one busy core, oversized pool against the scheduler)
         // sits at tens of ms, where single-threading wins. Eight joins over 4 ms (a step's
         // worth, counted after a 32-call spawn grace) cap the pool at one worker for the rest
-        // of the process; EXL3_HC_MIX_CPU_ADAPT=0 disables the cap
+        // of the process; EXL3_CPU_HC_MIX_ADAPT=0 disables the cap
         ++joins;
         if (joins > 32 && hc_now_ns() - t0 > 4000000 && ++slow_joins >= 8 && adapt_cap) n_eff = 1;
     }
@@ -194,7 +194,7 @@ inline int hc_cpu_threads()
     // the bandwidth gain (measured: hc 45 ms/step at 6, 75 at 8, 205 at 12 on the bench model)
     static const int v = [] {
         int t = 0;
-        const char* e = std::getenv("EXL3_HC_MIX_CPU_THREADS");
+        const char* e = std::getenv("EXL3_CPU_HC_MIX_THREADS");
         if (e) t = std::atoi(e);
         if (t <= 0)
             t = std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 4);
@@ -210,7 +210,7 @@ inline int hc_prf_dist()
 {
     static const int v = [] {
         int d = 0;
-        const char* e = std::getenv("EXL3_HC_PRF_DIST");
+        const char* e = std::getenv("EXL3_CPU_HC_PRF_DIST");
         if (e) d = std::atoi(e);
         return d > 0 ? d : 0;
     }();
@@ -420,7 +420,7 @@ void gr_mix_cpu
                 "gr_mix_cpu: tensors must be on CPU");
     TORCH_CHECK(streams.scalar_type() == at::kFloat && streams.is_contiguous() && streams.dim() == 3,
                 "streams must be contiguous CPU float (R, H, D)");
-    // fn/up: fp16 (default) or both bf16 (EXL3_HC_BF16) -- dispatch below
+    // fn/up: fp16 (default) or both bf16 (EXL3_CPU_HC_BF16) -- dispatch below
     const bool bf16 = fn.scalar_type() == at::kBFloat16;
     TORCH_CHECK((fn.scalar_type() == at::kHalf || bf16) && fn.is_contiguous() && fn.dim() == 2,
                 "fn must be contiguous CPU half or bfloat16 (M, H * D)");
