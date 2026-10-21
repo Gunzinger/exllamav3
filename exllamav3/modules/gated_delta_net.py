@@ -1532,11 +1532,14 @@ class GatedDeltaNet(Module):
         else:
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
-            else:
+            elif x.device.type == "cpu":
                 # One worker-pool round set for both same-input projections on the CPU kernels
                 qkv, z = cpu_linear_forward_batch(
                     [self.qkv_proj, self.z_proj], x, params, [_proj_dtype, None]
                 )
+            else:
+                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+                z = self.z_proj.forward(x, params)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
 
             # Fused CPU decode step: b/a projections + beta/g gates + conv update + one-token

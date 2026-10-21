@@ -19,12 +19,21 @@ no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 # transposed (dword w to 8*(w%bits) + w/bits)
 _cpu_swizzle = os.environ.get("EXL3_MOE_CPU_SWIZZLE", "1") != "0"
 
-if _cpu_swizzle and os.name == "posix":
+_mallopt_done = False
+
+
+def _swizzle_mallopt():
     # The repack doubles each trellis tensor transiently; the freed native copy must go back to
     # the OS, not idle in the heap until the next same-size allocation (glibc's dynamic mmap
     # threshold rides every large free upward and retains GBs over a full-expert load). One
     # explicit mallopt freezes the threshold at its default: every >= 128 KiB block is mmap'd
-    # and unmapped on free, so peak RSS stays ~one tensor above the resident set
+    # and unmapped on free, so peak RSS stays ~one tensor above the resident set.
+    # Applied lazily at the first CPU swizzle repack so a process that never touches the CPU
+    # path (e.g. a pure GPU build) never gets its allocator reconfigured.
+    global _mallopt_done
+    if _mallopt_done or not (_cpu_swizzle and os.name == "posix"):
+        return
+    _mallopt_done = True
     import ctypes
     ctypes.CDLL(None).mallopt(-3, 128 << 10)   # M_MMAP_THRESHOLD
 
@@ -244,6 +253,7 @@ class LinearEXL3:
         moe_mul1 layer holds raw pointers into this tensor)."""
         if self.cpu_swz or not self.cpu_can_swizzle():
             return self.cpu_swz
+        _swizzle_mallopt()
         Kf = float(self.K)
         grp = ext.exl3_moe_cpu_swizzle_group(Kf)
         pln = bool(ext.exl3_moe_cpu_planar_layout(Kf))

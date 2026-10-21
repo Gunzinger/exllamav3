@@ -334,7 +334,8 @@ def _torch_bighead_fallback(
     softcap = None,
     chunk_size = 512,
 ):
-    _warn_sdpa_fallback()
+    if not sdpa_prefill(q.device):
+        _warn_sdpa_fallback()
     return _torch_paged_gather_sdpa(
         q, k, v, k_cache, v_cache, block_table, cache_seqlens,
         softmax_scale, causal, chunk_size,
