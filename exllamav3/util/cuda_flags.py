@@ -113,9 +113,26 @@ def _hip_excluded(rel_path: str) -> bool:
     )
 
 
+# Fork-only translation units that must never enter a CUDA/HIP build. The GPU source sweep
+# below walks the whole extension tree, and these TUs exist for the CPU-only build alone:
+# bindings_cpu.cpp defines a second PYBIND11_MODULE (duplicate PyInit_exllamav3_ext),
+# cpu/ngram_cpu.cpp re-defines the ngram_* host functions ngram.cu already provides, and
+# cpu_compat/cuda_stub.cpp both duplicates stloader_cu.cu's conversion helpers and
+# re-defines the CUDA runtime API it exists to stand in for, which would hijack
+# stloader.cpp's in-module runtime calls. Upstream's cpu/moe_mul1.cpp stays in both builds:
+# the GPU extension compiles it for the CPU-MoE offload worker and the fork's
+# exl3_moe_cpu_forward_gated binding. Root TUs shared by both builds (avx*_target,
+# hadamard, sam, stloader) are not listed here and remain in the sweep.
+_CPU_ONLY_IN_GPU_SWEEP = frozenset(
+    rel for rel in CPU_SOURCES
+    if rel.startswith("cpu/") and rel != "cpu/moe_mul1.cpp"
+) | {"bindings_cpu.cpp"}
+
+
 def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
     """Absolute paths of the extension's translation units for a CUDA or ROCm build. Sources under
-    rocm/ (the RDNA kernels and the ROCm compat layer) belong to ROCm builds only."""
+    rocm/ (the RDNA kernels and the ROCm compat layer) belong to ROCm builds only; the fork's
+    CPU-only TUs (_CPU_ONLY_IN_GPU_SWEEP + cpu_compat/) belong to the CPU-only build only."""
     base = os.path.abspath(sources_dir)
     sources = []
     for root, _, files in os.walk(base):
@@ -123,6 +140,8 @@ def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
             path = os.path.join(root, file)
             rel = os.path.relpath(path, base).replace(os.sep, "/")
             if not file.endswith((".c", ".cpp", ".cu")) or is_hipify_output(file):
+                continue
+            if rel in _CPU_ONLY_IN_GPU_SWEEP or rel.startswith("cpu_compat/"):
                 continue
             if hip and _hip_excluded(rel):
                 continue

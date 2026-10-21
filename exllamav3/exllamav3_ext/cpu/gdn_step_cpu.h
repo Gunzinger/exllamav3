@@ -18,7 +18,7 @@
 //   out   = bf16(scan out) -> rmsnorm -> weight (+ bias) -> gate(z) -> fp16
 // All accumulation fp32; state rows and conv ring rows are updated in place. Three phases
 // (gates+conv, scan, norm) over a private floating spin-parked pool (hc_mix_cpu.cpp Pool) with
-// in-function barriers; threads = EXL3_GDN_STEP_CPU_THREADS, else 4. Requires
+// in-function barriers; threads = EXL3_CPU_GDN_THREADS, else 4. Requires
 // AVX-512F/BW/VL/DQ + FMA + F16C (gdn_step_cpu_has_avx512); callers fall back to the torch
 // path when it reports false or the tensors are ineligible.
 //   x:             (bsz, 1, hidden) half

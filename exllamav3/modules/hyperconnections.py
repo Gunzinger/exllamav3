@@ -35,13 +35,13 @@ except Exception:
 # mix -- never at load, the deferred loader must not see extra byte copies -- and cached per
 # module. Default on since the M1 gate: parity <= 5.6e-4 vs the fp32 reference (test_hc_mix
 # test_parity_bf16_tables) and the 4.05bpw self-golden is token-exact 48/48 with zero top-1
-# logit drift; EXL3_HC_BF16=0 restores the fp16 tables
-_hc_bf16_tables = os.environ.get("EXL3_HC_BF16", "1") != "0"
+# logit drift; EXL3_CPU_HC_BF16=0 restores the fp16 tables
+_hc_bf16_tables = os.environ.get("EXL3_CPU_HC_BF16", "1") != "0"
 
 # T2: the site residual update (apply_'s CPU branch, two calls per decoder layer) as one C++
 # elementwise dispatch instead of five torch ops, bit-equal to the torch line on both x dtypes
-# (fp32 trunk stack, fp16 MTP draft stack). EXL3_HC_APPLY_CPU=0 restores the torch path
-_hc_apply_cpu = os.environ.get("EXL3_HC_APPLY_CPU", "1") != "0"
+# (fp32 trunk stack, fp16 MTP draft stack). EXL3_CPU_HC_APPLY=0 restores the torch path
+_hc_apply_cpu = os.environ.get("EXL3_CPU_HC_APPLY", "1") != "0"
 
 
 def hc_flush(params: dict):
@@ -394,7 +394,7 @@ class GatedResidual(Module):
         self.proj_h = None          # cat(down, inject) half, zero-padded to a multiple of 64
                                     # rows for the tiled path (other paths use [:proj_m])
         self.proj_m = 0             # rows of proj_h in use: rank (+ hc_mult in the site form)
-        self.proj_bf16 = None       # (proj_m, H * D) bf16, lazy CPU-side cache (EXL3_HC_BF16)
+        self.proj_bf16 = None       # (proj_m, H * D) bf16, lazy CPU-side cache (EXL3_CPU_HC_BF16)
         self.up_bf16 = None         # (H * D, rank) bf16, same
         self.rank = 0
         self.tiled = False          # prefill mixes take the tiled deterministic kernel

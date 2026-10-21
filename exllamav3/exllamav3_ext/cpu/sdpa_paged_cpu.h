@@ -13,7 +13,7 @@
 // and reduced with an online softmax (running max, running sum, rescaled fp32 output
 // accumulator), and the output is rounded to fp16 exactly once on store. fp16 loads, fp32 FMA
 // accumulation throughout. Head tasks (B*Q*H) run on the exported moe worker pool
-// (exl3_moe_cpu_pool_run; EXL3_SDPA_PAGED_CPU_THREADS, default 6, 1 = serial, never exceeds
+// (exl3_moe_cpu_pool_run; EXL3_CPU_SDPA_THREADS, default 6, 1 = serial, never exceeds
 // the pool's current size; an unspawned pool runs serially). Per-head math is worker-
 // independent, so any worker count gives bit-identical output. Requires
 // AVX-512F/BW/VL/DQ + FMA + F16C (sdpa_paged_cpu_has_avx512); the Python side keeps the torch

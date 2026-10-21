@@ -231,7 +231,7 @@ int sdpa_paged_cpu_threads()
     // the pool's current size and an unspawned pool runs serially. 1 = serial
     static const int v = [] {
         int t = 6;
-        const char* e = std::getenv("EXL3_SDPA_PAGED_CPU_THREADS");
+        const char* e = std::getenv("EXL3_CPU_SDPA_THREADS");
         if (e && *e) t = std::atoi(e);
         return std::max(1, t);
     }();

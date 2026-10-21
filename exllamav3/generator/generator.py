@@ -685,7 +685,7 @@ class Generator:
             try:
                 job.prefill(results)
             except Exception as e:
-                if os.environ.get("EXL3_DEBUG_JOB"):
+                if os.environ.get("EXL3_CPU_DEBUG_JOB"):
                     import traceback
                     traceback.print_exc()
                 self.reap_failed_job(job, e, results)

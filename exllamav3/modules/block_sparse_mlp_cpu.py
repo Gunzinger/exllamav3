@@ -6,13 +6,13 @@ from ..ext import exllamav3_ext as ext
 from .block_sparse_mlp_routing import _routing_buffers, routing_std
 
 # C5 fused CPU router (ext.router_std_cpu): one AVX-512 C++ call per layer for the "std"
-# routing type; EXL3_ROUTER_CPP=0 restores the torch path for A/B testing
-_router_cpp = os.environ.get("EXL3_ROUTER_CPP", "1") != "0"
+# routing type; EXL3_CPU_ROUTER_CPP=0 restores the torch path for A/B testing
+_router_cpp = os.environ.get("EXL3_CPU_ROUTER_CPP", "1") != "0"
 
 # T1 fused shared-expert tail (ext.exl3_moe_cpu_forward_gated): shared-expert GEMVs, shared-gate
-# GEMV, sigmoid, mul-add and the out_dtype cast in one call; EXL3_MOE_GATE_FUSED=0 restores the
+# GEMV, sigmoid, mul-add and the out_dtype cast in one call; EXL3_CPU_MOE_GATE_FUSED=0 restores the
 # torch epilogue for A/B testing
-_gate_fused = os.environ.get("EXL3_MOE_GATE_FUSED", "1") != "0"
+_gate_fused = os.environ.get("EXL3_CPU_MOE_GATE_FUSED", "1") != "0"
 
 def _routing_std_cpu(bsz, cfg, y, params):
     """Fast path through ext.router_std_cpu (fp16 GEMV with fp32 accumulation rounded to half

@@ -28,13 +28,13 @@ def _warn_sdpa_fallback():
 
 
 # C7 fused paged-attention kernel (ext.sdpa_paged_cpu): reads the KV pages in place, no gather.
-# Default-on (EXL3_SDPA_PAGED_CPU=0 restores the torch gather path); every ineligible shape
+# Default-on (EXL3_CPU_SDPA_PAGED=0 restores the torch gather path); every ineligible shape
 # keeps the torch path below. Class relaxation accepted 2026-10-20 on KL evidence
 # (REPORT-lossy-features.md): median KL 2e-2 vs the torch path, argmax flips only at <=0.44-logit
 # top1-top2 margins, deterministic; +28 % tok/s and +29 % tokens/J at 1024-tok ctx, no-op past
 # the QSA sparse threshold (2051) where the kernel is not engaged
 _sdpa_paged_cpu = getattr(ext, "sdpa_paged_cpu_has_avx512", lambda: False)()
-_sdpa_paged_cpu_enable = os.environ.get("EXL3_SDPA_PAGED_CPU", "1") != "0"
+_sdpa_paged_cpu_enable = os.environ.get("EXL3_CPU_SDPA_PAGED", "1") != "0"
 
 
 def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
@@ -334,7 +334,8 @@ def _torch_bighead_fallback(
     softcap = None,
     chunk_size = 512,
 ):
-    _warn_sdpa_fallback()
+    if not sdpa_prefill(q.device):
+        _warn_sdpa_fallback()
     return _torch_paged_gather_sdpa(
         q, k, v, k_cache, v_cache, block_table, cache_seqlens,
         softmax_scale, causal, chunk_size,

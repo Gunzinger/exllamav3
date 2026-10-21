@@ -30,21 +30,21 @@ _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" el
 _gate_dtype = torch.float if os.environ.get("EXL3_GDN_GATE_FP32", "1") != "0" else torch.half
 # Prefill conv reads the projection output in place (token-major) instead of a transposed bf16 copy
 _conv_token_major = os.environ.get("EXL3_GDN_CONV_TOKEN_MAJOR", "1") != "0"
-# EXL3_GDN_STEP=0 disables the fused CPU decode step (gdn_step_cpu), for A/B testing
-_gdn_step_enable = os.environ.get("EXL3_GDN_STEP", "1") != "0"
+# EXL3_CPU_GDN_STEP=0 disables the fused CPU decode step (gdn_step_cpu), for A/B testing
+_gdn_step_enable = os.environ.get("EXL3_CPU_GDN_STEP", "1") != "0"
 # Worker count of the fused step's pool; 0 leaves the kernel's own default (1: waking parked
 # workers under the moe pool + system load measured far worse than the single-threaded sweep)
-_gdn_step_threads = int(os.environ.get("EXL3_GDN_STEP_CPU_THREADS", "0"))
-# EXL3_GDN_CHUNK_SCAN=1 opts into the fused CPU prefill pass (gdn_chunk_scan_cpu). Landed
+_gdn_step_threads = int(os.environ.get("EXL3_CPU_GDN_THREADS", "0"))
+# EXL3_CPU_GDN_CHUNK_SCAN=1 opts into the fused CPU prefill pass (gdn_chunk_scan_cpu). Landed
 # DEFAULT OFF 2026-10-20: interleaved ABAB prefill A/B measured the WY kernel ~1.6x SLOWER
 # than the torch chunk path it replaces (fused middle section 4.2 vs 2.7 s per 278-tok
 # window; prefill 24 -> 20 tok/s; rows t3-prefill-*-ab) while its numerics are a real class
 # change (self-golden long 10/16, drift 2.59) — negative payoff AND distance = off. The
 # kernel + its parity rows stay for a future optimization pass (unit parity vs the torch
 # chain: out <= 9.8e-3, state <= 6.1e-5).
-_gdn_chunk_scan_enable = os.environ.get("EXL3_GDN_CHUNK_SCAN", "0") == "1"
+_gdn_chunk_scan_enable = os.environ.get("EXL3_CPU_GDN_CHUNK_SCAN", "0") == "1"
 # Worker count of the prefill pass's pool; 0 leaves the kernel's own default (4)
-_gdn_chunk_scan_threads = int(os.environ.get("EXL3_GDN_CHUNK_SCAN_THREADS", "0"))
+_gdn_chunk_scan_threads = int(os.environ.get("EXL3_CPU_GDN_SCAN_THREADS", "0"))
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import (
     causal_conv1d_update,
@@ -1532,11 +1532,14 @@ class GatedDeltaNet(Module):
         else:
             if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
-            else:
+            elif x.device.type == "cpu":
                 # One worker-pool round set for both same-input projections on the CPU kernels
                 qkv, z = cpu_linear_forward_batch(
                     [self.qkv_proj, self.z_proj], x, params, [_proj_dtype, None]
                 )
+            else:
+                qkv = self.qkv_proj.forward(x, params, out_dtype = _proj_dtype)
+                z = self.z_proj.forward(x, params)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
 
             # Fused CPU decode step: b/a projections + beta/g gates + conv update + one-token
