@@ -58,6 +58,12 @@ elif cpu_only:
         extra_cuda_cflags = [],
         extra_cflags = extra_cflags
     )
+
+    # torch's load() does not register the module in sys.modules; do it here so a subsequent
+    # bare "import exllamav3_ext" resolves the JIT-built CPU module instead of searching
+    # sys.path — where the unified tree's repo root exposes the HIP-built root .so to any
+    # venv whose editable install puts it there
+    sys.modules[extension_name] = exllamav3_ext
 else:
 
     # Kludge to get compilation working on Windows
