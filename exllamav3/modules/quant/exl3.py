@@ -4,6 +4,7 @@ from ...model.config import Config
 from .exl3_lib.quantize import frac_k, preapply_had_l, preapply_had_r, had_k, had_n
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
+from .recon_cache import recon_cache as _recon_cache
 import os
 from ...util import profile_opt
 
@@ -232,6 +233,8 @@ class LinearEXL3:
 
 
     def unload(self):
+        # Release this layer's reconstruct shadows (no-op unless EXL3_RECON_CACHE_MIB is on)
+        _recon_cache.drop_linear(self)
         # g_tensor_cache.drop(*self.bsz1_xh_args)
         pass
 
@@ -374,12 +377,32 @@ class LinearEXL3:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
 
+        # Reconstruct-once shadow (opt-in EXL3_RECON_CACHE_MIB, plan 04). Consulted only on the
+        # rows > 144 tier (the batch-1/decode GEMV path below AUTO_RECONSTRUCT_THRESHOLD and any
+        # forced small-rows reconstruct must never touch it) and only on the single-shot N path:
+        # the sliced loop below (out_features > 32768, lm_head-class shapes) keeps its per-call
+        # reconstruct, since shadow column slices would need contiguous copies per call. The
+        # shadow stores the same basis the active path reconstructs (plain = rotated-basis via
+        # _reconstruct_inner, fused = original-basis via reconstruct_had_slice with full svh); a
+        # hit then replays the identical hgemm (+ surrounding had_r_128) sequence on identical
+        # contents, so cached calls are byte-identical to reconstruct-per-call.
+        cache_this = (
+            rows > AUTO_RECONSTRUCT_THRESHOLD
+            and _recon_cache.enabled()
+            and _recon_cache.key_cacheable(self.key)
+        )
+        basis = 1 if use_fused else 0
+        w, hit = _recon_cache.lookup(self, basis) if cache_this else (None, False)
+
         if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
-            w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
-            if use_fused:
-                ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
-            else:
-                self._reconstruct_inner(w, 0)
+            if w is None:
+                w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
+                if use_fused:
+                    ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
+                else:
+                    self._reconstruct_inner(w, 0)
+                if cache_this and not hit:
+                    _recon_cache.store(self, basis, w)
             ext.hgemm_recon(xh, w, y_)
         else:
             numel_ = self.in_features * MAX_RECONSTRUCT_SLICE_N

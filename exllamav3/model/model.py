@@ -444,6 +444,10 @@ class Model(Model_TPMixin, Model_LSMixin):
     def unload(self):
         for module in self.modules:
             module.unload()
+        # Reconstruct shadows (EXL3_RECON_CACHE_MIB) are pure functions of this model's packed
+        # tensors; drop anything the per-module unload above did not already release
+        from ..modules.quant.recon_cache import recon_cache
+        recon_cache.clear()
         # The loader's open slab blocks must not outlive the tensors sliced from them
         self.config.stc.release_arena()
         self.active_devices = []

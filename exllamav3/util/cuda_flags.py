@@ -312,3 +312,20 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
                 f"--compress-mode (CUDA 12.8 or later is needed)"
             )
     return flags
+
+
+# --- Reconstruct-once shadow cache knob (branch opt/recon-cache, plan 04) ----------------------------------
+# Deliberately a self-contained block (a concurrent branch adds a different knob to this file), and
+# deliberately a runtime knob in the build-flags module only because the plan pins the plumbing here:
+# it is read at call time via recon_cache_budget_bytes(), never at import, so unit tests can flip it.
+# 0 MiB = disabled (default; the feature is opt-in per the plan's rollback clause).
+RECON_CACHE_MIB_ENV = "EXL3_RECON_CACHE_MIB"
+
+
+def recon_cache_budget_bytes() -> int:
+    """GTT budget of the FP16 reconstruct shadow cache in bytes, from EXL3_RECON_CACHE_MIB."""
+    try:
+        mib = int(os.environ.get(RECON_CACHE_MIB_ENV, "0"))
+    except ValueError:
+        mib = 0
+    return max(0, mib) << 20
