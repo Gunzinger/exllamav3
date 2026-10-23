@@ -312,3 +312,22 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
                 f"--compress-mode (CUDA 12.8 or later is needed)"
             )
     return flags
+
+
+# --- opt02: EXL3_MOE_DEVICE_COUNT -----------------------------------------------------------
+# Env-knob registry entry (doc/env_vars.md). Kept in its own block at the end of this file to
+# avoid merge conflicts with concurrent knob additions. This file is loaded by setup.py with the
+# standard library only, so the knob is read here with os.environ and re-exported for consumers
+# (modules/block_sparse_mlp.py) -- do not import torch above this point.
+#
+# EXL3_MOE_DEVICE_COUNT = 1 (default): on the MoE batch path (rows > MAX_BSZN, the prefill tier),
+#   - the per-layer expert-count readback is staged through a pinned ring (async D2H + event)
+#     instead of a pageable tensor.tolist() drain, and the FUSED_DET slot tables upload from the
+#     same ring (async H2D) instead of a per-layer pageable host_to_device, and
+#   - the fused exl3_moe launch uses a worst-case grid (num_active = -1; the kernel filters
+#     experts by its device-side copy of the counts, the same contract the all-fused fast path
+#     already relies on) instead of the host-side num_active hint, when M-tile banding is off.
+# EXL3_MOE_DEVICE_COUNT = 0: original path (tolist drain, pageable upload, num_active hint).
+# The bsz <= MAX_BSZN decode branch (run_bszN) and the CPU/MoeCpuHost offload branches are not
+# affected by this knob in either setting.
+MOE_DEVICE_COUNT = os.environ.get("EXL3_MOE_DEVICE_COUNT", "1") != "0"

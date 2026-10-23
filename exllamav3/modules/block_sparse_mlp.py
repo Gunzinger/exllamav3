@@ -10,6 +10,7 @@ from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
+from ..util.cuda_flags import MOE_DEVICE_COUNT
 from ..util import activation as act_mul
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP, capture_out_sensitivity
@@ -46,6 +47,52 @@ FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+
+
+class _PinnedCountRing:
+    """Pinned staging ring for the batch MoE path's per-layer expert-count readback and
+    FUSED_DET slot-table upload (opt02, EXL3_MOE_DEVICE_COUNT; see util/cuda_flags.py).
+
+    Replaces the pageable `expert_count.tolist()` device drain and the per-layer pageable
+    `host_to_device` of the slot tables with async copies against pinned buffers owned by the
+    ring, so no per-layer host allocation is involved and the H2D source provably outlives the
+    copy (the requirement device_copy.host_to_device documents for HIP).
+
+    Slot-reuse safety: read_counts() host-synchronizes on the current layer's readback event,
+    and that event follows every previously enqueued op in stream order -- including older ring
+    slots' table uploads -- so reusing a slot RING layers later cannot race a pending copy.
+    The stream still blocks on the counts (the tier plan consumes them on the host), so this is
+    staging groundwork, not yet sync removal; that needs the device-side tier plan (Path B).
+    """
+
+    RING = 4
+
+    def __init__(self, device: torch.device, e1: int):
+        self.device = device
+        self.e1 = e1
+        self.counts = [torch.zeros((e1,), dtype = torch.long, pin_memory = True) for _ in range(self.RING)]
+        self.tables = [torch.zeros((3, e1), dtype = torch.long, pin_memory = True) for _ in range(self.RING)]
+        self.events = [torch.cuda.Event() for _ in range(self.RING)]
+        self.idx = 0
+
+    def read_counts(self, expert_count: torch.Tensor) -> list:
+        """Stage the count vector D2H asynchronously, wait for it, return the host list.
+        Values are identical to expert_count.tolist()."""
+        i = self.idx
+        self.idx = (self.idx + 1) % self.RING
+        buf = self.counts[i]
+        buf.copy_(expert_count, non_blocking = True)
+        event = self.events[i]
+        event.record()
+        event.synchronize()
+        return buf.tolist()
+
+    def upload_tables(self, stacked: torch.Tensor) -> torch.Tensor:
+        """Async H2D of the (3, E1) slot tables from this layer's pinned slot."""
+        i = (self.idx - 1) % self.RING  # same slot as this layer's read_counts
+        buf = self.tables[i]
+        buf.copy_(stacked)
+        return buf.to(self.device, non_blocking = True)
 
 @dataclass
 class FusedBuffers:
@@ -951,6 +998,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             total = sum(self.prefill_worst_case_parts(rows, A))
         return total
 
+    def _count_ring(self, device: torch.device, e1: int) -> _PinnedCountRing:
+        """This module's pinned count/table staging ring, allocated on first use (opt02)."""
+        ring = getattr(self, "_pinned_count_ring", None)
+        if ring is None or ring.e1 != e1:
+            self._pinned_count_ring = ring = _PinnedCountRing(device, e1)
+        return ring
+
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
                          scratch = None, tables = None):
         """Run the planned groups through the batched reconstruct tier. With a slot scratch each
@@ -989,6 +1043,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.bc = None
         self.fused_mode_buffers = None
         self.batch_recon = None
+        self._pinned_count_ring = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -1163,6 +1218,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
                     expert_count_list = None
+                elif MOE_DEVICE_COUNT and y.device.type == "cuda":
+                    # opt02 (EXL3_MOE_DEVICE_COUNT): staged readback through the pinned ring.
+                    # Identical values to tolist(); pageable drain remains the knob-off path
+                    expert_count_list = self._count_ring(y.device, E + 1).read_counts(expert_count)
                 else:
                     expert_count_list = expert_count.tolist()
 
@@ -1224,7 +1283,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             for b, e in enumerate(grp):
                                 base[e] = n_slots + b * cmax; kind[e] = 2
                             n_slots += len(grp) * cmax
-                        tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
+                        stacked = torch.from_numpy(np.stack([base, starts_np, kind]))
+                        if MOE_DEVICE_COUNT and y.device.type == "cuda":
+                            # opt02: async H2D from the pinned ring (the ring owns the pinned
+                            # source, so the copy is safe on HIP as well)
+                            tables = self._count_ring(y.device, E1).upload_tables(stacked)
+                        else:
+                            tables = host_to_device(stacked, y.device)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
@@ -1283,6 +1348,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
                             if t0:
                                 run_fused(t0, 1, MTILE_T1, 16)
+                        elif MOE_DEVICE_COUNT:
+                            # opt02: worst-case-grid launch. The kernel filters experts by its
+                            # device-side copy of expert_count against [count_lo, count_hi] and
+                            # early-exits the rest -- the same unknown-counts contract the
+                            # all-fused fast path above relies on with run_fused(-1) -- so the
+                            # num_active hint is not needed for correctness. M-tile banding
+                            # (above) still uses the exact hint; this branch covers the rest.
+                            run_fused(-1)
                         else:
                             run_fused(len(counts))
 
