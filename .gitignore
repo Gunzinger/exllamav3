@@ -19,3 +19,6 @@ exllamav3/exllamav3_ext/**/hip_*
 # per-machine test model registry overrides (tests/testlib/models.py)
 tests/models.local.yaml
 .torch_ext/
+
+# JIT extension caches (per-worktree, e.g. the opt-cpu-bf16 avx512 build cache)
+.torch_ext*/
