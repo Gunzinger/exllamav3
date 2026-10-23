@@ -1155,3 +1155,14 @@ C++-side variables are read once on first use and cached, Python-side ones at im
 | `EXL3_CPU_RAPL_HELPER` | `/usr/local/bin/rapl-read` | Path of the capability-scoped RAPL read helper used by `bench_decode.py --energy`. |
 | `EXL3_CPU_RYZEN_INFO` | `/usr/local/bin/ryzen-info` | Path of the ryzenadj SMU info helper used by `bench_decode.py --energy` and `check-energy.sh`. |
 | `EXL3_CPU_ENERGY_UNCORE` | `1` | `0` disables the `uncore_win.py` DRAM-traffic attachment of an `--energy` run. |
+
+### `EXL3_MOE_DEVICE_COUNT` (default: `1`; opt02, branch `opt/tolist-counts`)
+
+Read in `util/cuda_flags.py` (own EOF block), consumed by `modules/block_sparse_mlp.py`. On the
+MoE **batch** path only (rows > MAX_BSZN; the bsz≤8 decode branch and the CPU/MoeCpuHost offload
+branches are unaffected): `1` stages the per-layer expert-count readback through a pinned ring
+(async D2H + event, values identical to `tolist()`) and uploads the `EXL3_MOE_FUSED_DET` slot
+tables from the same ring (async H2D instead of a per-layer pageable copy), and launches the
+fused kernel with a worst-case grid (`num_active = -1`, the kernel's unknown-counts contract)
+instead of the host `num_active` hint whenever M-tile banding does not apply. `0` restores the
+original path exactly (pageable `tolist()` drain, pageable upload, exact hint).
