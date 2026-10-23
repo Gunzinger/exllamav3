@@ -165,6 +165,11 @@ class CacheLayer_MLA_fp16(CacheLayer):
             # Pool entries covering the copied tokens (partial-pool entries are never read)
             n_pool = -(-num_tokens // self.kpool)
             self.k_pool[to_page, :n_pool, :].copy_(source.k_pool[from_page, :n_pool, :], non_blocking = True)
+            if getattr(source, "_dsa_pool_lazy", False):
+                # Lazy-planes arrears travel with the copied rows: the source's pool rows may
+                # be unbuilt (deferred dense window), so the destination needs the same
+                # one-time bulk rebuild before its pool plane is read (EXL3_DSA_LAZY_PLANES)
+                self._dsa_pool_lazy = True
 
 
     @override

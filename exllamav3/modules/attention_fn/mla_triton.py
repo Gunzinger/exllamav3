@@ -665,7 +665,7 @@ def _mla_stage_kernel(
 
 @triton.jit(do_not_specialize = [
     "q_row0", "s_len", "tile_start", "tile_len", "past0",
-    "tile_init", "tile_final", "tile_masked",
+    "tile_init", "tile_final", "tile_masked", "k_row_stride", "v_row_stride",
 ])
 def _mla_prefill_mha_kernel(
     q,                  # (R, H, QK_DIM) fp16, token-major: [nope | pe] per head
@@ -684,6 +684,9 @@ def _mla_prefill_mha_kernel(
     tile_init,          # runtime: first tile -- initialize the running state
     tile_final,         # runtime: last tile -- normalize and emit fp16 output
     tile_masked,        # runtime: tile crosses the causal boundary
+    k_row_stride,       # runtime: row stride of k_nope (H * D_nope when contiguous, wider
+                        # when the tile is a column slice of the batched up-projection)
+    v_row_stride,       # runtime: row stride of v, same
     n_q_heads: tl.constexpr,
     QK_DIM: tl.constexpr,
     D_nope: tl.constexpr,
@@ -738,7 +741,7 @@ def _mla_prefill_mha_kernel(
         offs_n = n0 + tl.arange(0, BLOCK_N)
         in_r = offs_n < tile_len
 
-        kt = tl.load(k_nope + offs_n[None, :] * (n_q_heads * D_nope) + head * D_nope + offs_nope[:, None],
+        kt = tl.load(k_nope + offs_n[None, :] * k_row_stride + head * D_nope + offs_nope[:, None],
                      mask = in_r[None, :] & nope_ok[:, None], other = 0.0)
         scores = tl.dot(q_n, kt)
         if D_r > 0:
@@ -759,7 +762,7 @@ def _mla_prefill_mha_kernel(
         alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
         l = l * alpha + tl.sum(p, axis = 1)
 
-        v_t = tl.load(v + offs_n[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :],
+        v_t = tl.load(v + offs_n[:, None] * v_row_stride + head * D_v + offs_v[None, :],
                       mask = in_r[:, None], other = 0.0)
         acc = acc * alpha[:, None] + tl.dot(p.to(v_t.dtype), v_t)
         m = m_new
@@ -1114,11 +1117,17 @@ def mla_attn_triton_prefill_mha(
     block_n: int = 64,
     num_warps: int = 8,
     num_stages: int = 2,
+    w_kv_cat: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MHA-form prefill: the past is up-projected from the compressed cache in tiles (gather +
     dequant, then two plain GEMMs against the flattened kv_b halves), and a per-tile kernel
     attends with running softmax state. Returns (R, H, v_head_dim) fp16 token-major, the
-    direct o_proj input; neither absorb nor unfold bmm is involved on this path."""
+    direct o_proj input; neither absorb nor unfold bmm is involved on this path.
+
+    w_kv_cat (EXL3_DSA_BATCH_UPPROJ, part B step 1) is the two kv_b halves pre-concatenated
+    on the N dim; the up-projection then runs as ONE GEMM into a merged tile buffer whose
+    column halves the attention kernel strides through separately (k_row_stride/v_row_stride
+    carry the slice views' shared row stride)."""
     R, H, qk_dim = q.shape
     assert R == bsz * q_len
     D_c = w_uk_flat.shape[0]
@@ -1153,10 +1162,17 @@ def mla_attn_triton_prefill_mha(
         return torch.empty(shape, dtype = dtype, device = dev)
 
     ts = tile_size
+    if w_kv_cat is not None:
+        # Merged up-projection tile: one buffer, column halves = K-nope | V
+        kv_t = sbuf("mha_kv", (ts, H * (qk_nope_head_dim + v_head_dim)), torch.half)
+        k_nope_t = kv_t[:, : H * qk_nope_head_dim]
+        v_t = kv_t[:, H * qk_nope_head_dim :]
+    else:
+        kv_t = None
+        k_nope_t = sbuf("mha_kn", (ts, H * qk_nope_head_dim), torch.half)
+        v_t = sbuf("mha_v", (ts, H * v_head_dim), torch.half)
     ckv_t = sbuf("mha_ckv", (ts, D_c), torch.half)
     kpe_t = sbuf("mha_kpe", (ts, D_r), torch.half)
-    k_nope_t = sbuf("mha_kn", (ts, H * qk_nope_head_dim), torch.half)
-    v_t = sbuf("mha_v", (ts, H * v_head_dim), torch.half)
     qb = -(-q_len // 2048) * 2048
     state_m = sbuf("mha_m", (H * qb,), torch.float)[: H * q_len].view(H, q_len)
     state_l = sbuf("mha_l", (H * qb,), torch.float)[: H * q_len].view(H, q_len)
@@ -1178,9 +1194,14 @@ def mla_attn_triton_prefill_mha(
                     qc_bits, page_size, D_c, D_r, 64,
                     num_warps = 4, num_stages = 2,
                 )
-                # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
-                torch.mm(ckv_t[:tl_len], w_uk_flat, out = k_nope_t[:tl_len])
-                torch.mm(ckv_t[:tl_len], w_uv_flat, out = v_t[:tl_len])
+                # Up-projection as one batched GEMM against the concatenated kv_b halves
+                # (never the strided-batched form); the split views share the merged tile's
+                # row stride, which the kernel takes as k_row_stride/v_row_stride
+                if kv_t is not None:
+                    torch.mm(ckv_t[:tl_len], w_kv_cat, out = kv_t[:tl_len])
+                else:
+                    torch.mm(ckv_t[:tl_len], w_uk_flat, out = k_nope_t[:tl_len])
+                    torch.mm(ckv_t[:tl_len], w_uv_flat, out = v_t[:tl_len])
                 while True:
                     try:
                         _mla_prefill_mha_kernel[(triton.cdiv(q_len, block_m), H)](
@@ -1188,6 +1209,7 @@ def mla_attn_triton_prefill_mha(
                             state_m, state_l, state_acc, out,
                             b * q_len, q_len, a, tl_len, past0,
                             int(ti == 0), int(ti == len(tiles) - 1), int(e - 1 > past0),
+                            k_nope_t.stride(0), v_t.stride(0),
                             H, qk_dim, qk_nope_head_dim, triton.next_power_of_2(qk_nope_head_dim),
                             D_r, v_head_dim, float(softmax_scale),
                             block_m, block_n,

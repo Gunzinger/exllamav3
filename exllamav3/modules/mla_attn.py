@@ -43,6 +43,24 @@ MAX_DECODE_QLEN = 16
 _score_tile = int(os.environ.get("EXL3_DSA_SCORE_TILE", 32768))
 assert _score_tile % 256 == 0 and _score_tile > 0
 
+# Lazy indexer-pool planes (plan 05, part A): while the visible context fits the dense window
+# (<= index_topk) DSA selection is all-inclusive and reads only the latent cache, so the
+# k-pool plane upkeep chain is deferred; the first step that needs the pool plane (a sparse
+# prefill chunk, or a graph-captured decode step -- see bc_mla_step) rebuilds every complete
+# pool in one batched pass from the cached idx-key plane. A pool's key is a pure function of
+# the plane's packed [k || gate] rows plus the constant APE, and complete pools are immutable,
+# so the rebuild is exact (bit-identical, same arithmetic over the same rows).
+_dsa_lazy_planes = os.environ.get("EXL3_DSA_LAZY_PLANES", "0") == "1"
+
+# Part B step 1: batch the two dense-MHA up-projection GEMMs into one (kv_b halves
+# concatenated on the N dim, split views after, strides handed to the attention kernel)
+_dsa_batch_upproj = os.environ.get("EXL3_DSA_BATCH_UPPROJ", "0") == "1"
+
+# Part B step 2 scaffold (NOT implemented): fuse the up-projection into the MHA prefill
+# kernel per query tile behind this gate. Reserved so the knob is discoverable; enabling it
+# today is a no-op.
+_dsa_fused_upproj = os.environ.get("EXL3_DSA_FUSED_UPPROJ", "0") == "1"
+
 
 
 def _host_seqlens(params: dict, cache_seqlens: torch.Tensor) -> list:
@@ -202,6 +220,15 @@ class MLAttention(Module):
         # serves every path, and no cuBLAS batched GEMM is involved anywhere in the module
         self.w_uk_flat = None   # (kv_lora_rank, H * qk_nope_head_dim)
         self.w_uv_flat = None   # (kv_lora_rank, H * v_head_dim)
+        # Lazy-planes (EXL3_DSA_LAZY_PLANES): pre-allocated device-resident scalar that
+        # replaces the per-chunk torch.tensor([first_pool], device=...) pageable H2D in the
+        # pool upkeep. A pinned staging buffer + non_blocking copy would race the CPU refill
+        # against an in-flight copy from a previous chunk submission; a stream-ordered
+        # device fill_ has no H2D and no race.
+        self._dsa_pool_offs = None
+        # Batched up-projection (EXL3_DSA_BATCH_UPPROJ): the two kv_b halves concatenated on
+        # the N dim, built once on first dense-MHA prefill (see _mha_form)
+        self._w_kv_b_cat = None
         self._scratch = {}
 
         # Tensor-parallel rank that does not hold this layer (MLA runs whole on one device): a
@@ -306,6 +333,15 @@ class MLAttention(Module):
         R = bsz * seqlen
         q = q.view(R, H, self.qk_head_dim)
         q[:, :, self.qk_nope_head_dim:] = q_pe.reshape(R, H, self.qk_rope_head_dim)
+        w_kv_cat = None
+        if _dsa_batch_upproj and self.w_uk_flat is not None and mla_attn_triton_prefill_mha is not None:
+            # Part B step 1: one batched GEMM against the kv_b halves concatenated on the N
+            # dim (built once; (kv_lora_rank, H * (D_nope + D_v)) fp16 -- 16 MiB/layer at
+            # GLM dims), split views after, strides handed to the attention kernel
+            if self._w_kv_b_cat is None or self._w_kv_b_cat.device != q.device:
+                self._w_kv_b_cat = torch.cat(
+                    (self.w_uk_flat, self.w_uv_flat), dim = 1).contiguous()
+            w_kv_cat = self._w_kv_b_cat
         o = mla_attn_triton_prefill_mha(
             q,
             self.w_uk_flat, self.w_uv_flat,
@@ -313,6 +349,7 @@ class MLAttention(Module):
             bsz, seqlen, self.v_head_dim, self.qk_nope_head_dim, self.sm_scale,
             pre_appended_len = seqlen,
             qc = qc,
+            w_kv_cat = w_kv_cat,
         )
         o = o.reshape(bsz, seqlen, H * self.v_head_dim)
         return self._out(o, params)
@@ -629,38 +666,51 @@ class MLAttention(Module):
         return indices
 
 
-    def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen):
+    def _update_pool_plane(self, idx_layer, block_table, host_seqlens, seqlen, bulk = False):
         """
         Incrementally extend the pooled-key plane with the pools completed by this chunk's
         append. A pool's key is the (gate_scores + APE)-softmax-weighted mean of its
         index_kpool members' keys; members are read back from the packed per-token plane
         (already appended), so pools straddling chunk boundaries resolve correctly. Complete
         pools are immutable, so each is written exactly once.
+
+        bulk=True (EXL3_DSA_LAZY_PLANES): rebuild EVERY complete pool [0, total//P) in one
+        batched pass, for the dense->sparse crossing after upkeep was deferred. The pool key
+        is a pure function of the plane's packed rows (read back here) plus the constant APE,
+        so this is the same arithmetic over the same rows as the incremental upkeep and the
+        rebuilt entries are bit-identical to it. Pools are processed in slabs so the fp32
+        member transient stays bounded at long context.
         """
         P, D_i = self.index_kpool, self.index_head_dim
         plane = idx_layer.get_idx()
         epp = plane.shape[1]
         flat = plane.view(-1, 2 * D_i)
         ape = self.idx_kpool_ape
+        if self._dsa_pool_offs is None or self._dsa_pool_offs.device != plane.device:
+            self._dsa_pool_offs = torch.zeros((1,), dtype = torch.int32, device = plane.device)
+        offs = self._dsa_pool_offs
+        slab_pools = 2048
         for b in range(block_table.shape[0] if block_table.dim() == 2 else 1):
             pos0 = host_seqlens[b]
-            first_pool = pos0 // P
+            first_pool = 0 if bulk else pos0 // P
             last_pool = (pos0 + seqlen) // P
-            n_new = last_pool - first_pool
-            if n_new <= 0:
+            if last_pool <= first_pool:
                 continue
             bt = block_table[b]
-            tok = torch.arange(first_pool * P, last_pool * P, device = plane.device)
-            rows = bt[tok // epp].long() * epp + tok % epp
-            members = flat[rows].view(n_new, P, 2 * D_i).float()
-            keys, gates = members[..., :D_i], members[..., D_i:]
-            probs = torch.softmax(gates + ape.unsqueeze(0), dim = 1)
-            pool_keys = (probs * keys).sum(dim = 1).to(torch.half)
-            idx_layer.update_pool_direct(
-                torch.tensor([first_pool], dtype = torch.int32, device = plane.device),
-                bt.unsqueeze(0) if bt.dim() == 1 else bt,
-                pool_keys.unsqueeze(0),
-            )
+            for p0 in range(first_pool, last_pool, slab_pools):
+                p1 = min(p0 + slab_pools, last_pool)
+                tok = torch.arange(p0 * P, p1 * P, device = plane.device)
+                rows = bt[tok // epp].long() * epp + tok % epp
+                members = flat[rows].view(p1 - p0, P, 2 * D_i).float()
+                keys, gates = members[..., :D_i], members[..., D_i:]
+                probs = torch.softmax(gates + ape.unsqueeze(0), dim = 1)
+                pool_keys = (probs * keys).sum(dim = 1).to(torch.half)
+                offs.fill_(p0)
+                idx_layer.update_pool_direct(
+                    offs,
+                    bt.unsqueeze(0) if bt.dim() == 1 else bt,
+                    pool_keys.unsqueeze(0),
+                )
 
 
     def _indexer_topk_kpool(self, x, params, q_resid, bsz, seqlen, host_seqlens,
@@ -894,14 +944,30 @@ class MLAttention(Module):
 
         # Full-indexer layers compute this chunk's indexer keys unconditionally: on the cached
         # path they must land in the paged plane even while the context is still dense, so the
-        # selection has complete history once it activates
+        # selection has complete history once it activates. The idx rows are NOT derivable
+        # later (idx_wk/k_norm/rope/gate consume the transient block input x), so only the
+        # k-pool upkeep can be deferred -- and the sparse scorer reads the pool plane alone,
+        # which the bulk rebuild in _update_pool_plane reconstructs exactly from these rows
         k_idx = None
         if self.indexer_mode == "full":
             k_idx = self._indexer_keys(x, params, position, positions, position_ids, inv_freq)
             if idx_layer is not None:
                 idx_layer.update_idx_direct(cache_seqlens, block_table, k_idx, seqlen)
                 if self.index_kpool:
-                    self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen)
+                    if _dsa_lazy_planes and not sparse:
+                        # Dense regime: defer the pool upkeep. _dsa_pool_lazy marks the
+                        # plane's rows as not-yet-built; nothing reads them while dense
+                        # (selection is all-inclusive, attention runs over the latent cache)
+                        idx_layer._dsa_pool_lazy = True
+                    elif _dsa_lazy_planes and getattr(idx_layer, "_dsa_pool_lazy", False):
+                        # First sparse-mode step (or first step after any deferred window):
+                        # rebuild every complete pool in one batched pass, then resume
+                        # incremental upkeep from the next chunk on
+                        self._update_pool_plane(
+                            idx_layer, block_table, host_seqlens, seqlen, bulk = True)
+                        idx_layer._dsa_pool_lazy = False
+                    else:
+                        self._update_pool_plane(idx_layer, block_table, host_seqlens, seqlen)
 
         if sparse:
             if self.indexer_mode == "full":
@@ -1087,6 +1153,19 @@ class MLAttention(Module):
             bcm = self.dispatch_cache[key] = ((build_bc_mla(self, layer) if _bc_mla_enable else None) or False)
         if bcm is False:
             return None
+        if (
+            _dsa_lazy_planes and self.indexer_mode == "full" and self.index_kpool and
+            getattr(layer, "_dsa_pool_lazy", False)
+        ):
+            # Lazy-planes crossing during graph-captured decode: the captured graph maintains
+            # the pool plane incrementally from wherever it stands (bc_mla's own
+            # _dsa_pool_update_kernel runs inside the capture), so arrears from a deferred
+            # dense window must be rebuilt first or the plane keeps a hole that the sparse
+            # selection would read as zero keys. seqlen=0 builds exactly the pools complete
+            # before this step; the step's own incremental update extends from there.
+            self._update_pool_plane(
+                layer, block_table, _host_seqlens(params, cache_seqlens), 0, bulk = True)
+            layer._dsa_pool_lazy = False
         if self.indexer_mode is not None:
             # Host lengths for the dense/sparse regime decision; same key the dispatch path
             # uses, free when the generator passes host cache_seqlens
