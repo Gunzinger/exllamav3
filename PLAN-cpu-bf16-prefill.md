@@ -42,22 +42,32 @@ Option 2 (hand AVX-512 VDPBF16PS GEMM) and the MoE grouped tier are explicit fol
 - (c) fp64-truth gate at M=64/128: new path rel ≤ 4.9e-3 (bf16 class, gated ≤ 1e-2) and closer
   to truth than the stock int8-quant GEMV (rel_old 0.7–1.8e-2); argmax flips 0/64, 2/128.
 
-## Micro bench — `tests/micro_cpu_bf16.py` (torch threads 12, this host)
+## Micro bench — `tests/micro_cpu_bf16.py` (torch threads 12, quiet machine, reproducible)
+
+Cold = AVX-512 dequant + GEMM (cache off); warm = cached bf16 W. The first-session numbers
+(3.0× @M512) did not reproduce — oneDNN's bf16 GEMM has an M-dependent kernel threshold
+(~715 GF/s at M=512, ~1350 GF/s at M=2048); the reproducible table:
 
 | shape (k×n, K) | M | stock ms | tier-cold | tier-warm | speedup | warm GF/s |
 |---|---|---|---|---|---|---|
-| 4096×4096, 2.5 | 128 | 9.0 | 6.1 | 6.6 | 1.36× | 650 |
-| 4096×4096, 2.5 | 512 | 37.3 | 13.4 | 12.4 | **3.01×** | 1384 |
-| 4096×4096, 2.5 | 2048 | 149.6 | 51.6 | 50.5 | **2.97×** | 1362 |
-| 4096×8192, 2.0 | 128 | 18.3 | 8.8 | 7.7 | 2.40× | 1121 |
-| 4096×8192, 2.0 | 512 | 75.0 | 24.5 | 24.2 | **3.09×** | 1418 |
-| 4096×8192, 2.0 | 2048 | 215.5 | 102.2 | 96.0 | 2.25× | 1432 |
+| 4096×4096, 2.5 | 128 | 9.0 | 28.4 | 6.1 | 1.44× | 709 |
+| 4096×4096, 2.5 | 512 | 37.2 | 35.7 | 24.1 | 1.54× | 713 |
+| 4096×4096, 2.5 | 2048 | 122.5 | 72.6 | 50.9 | **2.75×** | 1349 |
+| 4096×8192, 2.0 | 128 | 12.8 | 51.6 | 8.0 | 1.61× | 1079 |
+| 4096×8192, 2.0 | 512 | 54.4 | 68.5 | 24.4 | 2.23× | 1410 |
+| 4096×8192, 2.0 | 2048 | 209.6 | 128.6 | 92.0 | **2.28×** | 1494 |
 
-Gate "≥3× at M=128/512/2048": met at M=512 (both shapes) and ~met at 2048 narrow (2.97×);
-2.25× at 2048 wide and 1.36× at 128 narrow miss the letter of the gate — dequant amortization
-and matmul efficiency at small M bound Option 1 (~1.4 TF/s ≈ 37 % of Zen5 VDPBF16PS peak).
-Dequant cost itself ≈ 1 ms per 32 MiB W (≈37 GB/s single-thread scalar) — Option 2's SIMD
-dequant + GEMM is the follow-up lever (plan §Design Option 2, triggered: >20 % on the table).
+Gate "≥3× at M=128/512/2048": met only at M=2048 (2.3–2.75×); at M≤512 the warm GEMM is
+shape-bound (oneDNN threshold above) and cold loses (dequant not amortized at small M).
+AVX-512 dequant (07b): 4.1–5.1 GB/s, 48–59× the scalar binding, **bit-identical** output.
+
+## E2E warm-cache steady state — `tests/bench_prefill_warm.py` (quiet machine)
+
+4 × ~370-token prefill rounds, one process: tier-off steady 143.8 tok/s vs tier-torch steady
+138.3 tok/s (min-of-rounds 3.56 s vs 3.70 s) — **parity within noise** (round-to-round
+variance stays ±2× even clean, THP/cache bimodality). Cold round 52.0 vs 47.6 tok/s.
+Conclusion: with the MoE experts on the stock path (plan scope), the non-MoE linear share is
+too small for the tier's 1.5–2.75× per-tensor win to surface E2E.
 
 ## E2E prefill A/B — `bench_decode.py` (metrics twin on, GPU server stopped, AC)
 
@@ -106,9 +116,9 @@ stock-class times. Clean re-run queued for the quiet machine (numbers to fill in
    reimplementation tier (stock int8-activation noise ~1e-2 rel dominates; fp32 fallback
    measured worse than bf16 — see Parity gates). Goldens 16/16 exact at their horizon.
    → lands as documented lossy opt-in, default OFF; KL follow-up is the promotion gate.
-2. Micro "≥3× mul1-batch at M=128/512/2048": met at M=512 (3.0–3.1×) and 2048 narrow (2.97×);
-   2.25–2.6× at 2048 wide and 1.4–2.4× at 128 (dequant amortization + small-M GEMM efficiency;
-   07b SIMD dequant addresses the cold side).
+2. Micro "≥3× mul1-batch at M=128/512/2048": met at M=2048 (2.28–2.75×); 1.5–2.2× at M≤512
+   (oneDNN bf16 shape threshold + dequant amortization). AVX-512 dequant 48–59× scalar
+   (bit-identical) removes the cold-path obstacle the scalar version had.
 3. E2E "≥2× CPU prefill (target ≥60 t/s)": **NOT MET by Option 1 non-MoE-only scope.**
    Cold one-shot is a loss (dequant dominates); warm steady-state ≈ stock within noise — the
    non-MoE linears are a minor share of qwen prefill (MoE stays on the stock path by plan
@@ -119,7 +129,14 @@ stock-class times. Clean re-run queued for the quiet machine (numbers to fill in
 
 ## Open items
 
-- Option 2 (AVX-512 VDPBF16PS GEMM + SIMD dequant-to-bf16) — follow-up tranche.
-- MoE grouped tier (bucketed experts) — second env per plan, after linear path proven.
-- Thread discipline: tier currently rides torch's default threads (12); EXL3_MOE_CPU_THREADS
-  interplay untested.
+- MoE grouped tier (bucketed experts, second env per plan) — THE E2E lever: the non-MoE share
+  is too small for E2E movement (measured); the tier machinery, AVX-512 dequant, and shadow
+  cache all carry over.
+- KL quantification (kl_lossy.py, tier arms) — the promotion gate if default-on is ever
+  pursued; the 256-token flip records (bf16 332/768, fp32 426/768) are the input evidence.
+- Hand AVX-512 GEMM (VDPBF16PS): only worth it if the MoE tier lands and oneDNN's ~1350 GF/s
+  ceiling at M=2048 becomes the bottleneck.
+- Thread discipline: tier rides torch's default threads (12); EXL3_MOE_CPU_THREADS interplay
+  untested; the avx512 dequant uses std::thread strips (12).
+- Default OFF knobs: EXL3_CPU_PREFILL_TIER=off|torch|fp32, EXL3_CPU_PREFILL_MIN_M=32,
+  EXL3_CPU_PREFILL_CACHE_MIB=0, EXL3_CPU_PREFILL_AVX512=1 (kill-switch for the fast dequant).
