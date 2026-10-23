@@ -99,12 +99,11 @@ inline void hadamard_128_stride(float* v, int stride)
 inline float half_to_float(at::Half h) { return static_cast<float>(h); }
 
 template <int bits, bool hb>
-void dequant_impl(const MoeCpuMatrix& mat, float* w)
+void dequant_impl(const MoeCpuMatrix& mat, float* w, int g)
 {
     constexpr int words = 8 * rate_k2(bits, hb);
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
-    const int g = mat.swz;                       // 0 native, 8 band-8 (planar/2 rejected upstream)
     const size_t ring = words;
 
     // Decode: tile (kt, nt) covers out-rows nt*16..+16 and in-cols kt*16..+16; weight (row, col)
@@ -115,7 +114,7 @@ void dequant_impl(const MoeCpuMatrix& mat, float* w)
         {
             const size_t stored = g
                 ? static_cast<size_t>(nt / g) * tiles_k * g + static_cast<size_t>(kt) * g + (nt % g)
-                : static_cast<size_t>(nt) * tiles_k + kt;
+                : static_cast<size_t>(kt) * tiles_n + nt;   // native: trellis is [k/16, n/16, words]
             const uint16_t* tile = mat.trellis + stored * words;
             float* base = w + static_cast<size_t>(nt * 16) * mat.k + static_cast<size_t>(kt) * 16;
             for (int row = 0; row < 16; ++row)
@@ -181,9 +180,13 @@ at::Tensor exl3_cpu_dequant_bf16
     const double K_tile = mat.bits + (mat.hb ? 0.5 : 0.0);
     TORCH_CHECK(std::fabs(K - K_tile) < 1e-6,
                 "K (", K, ") does not match the trellis tile width (", K_tile, ")");
-    TORCH_CHECK(mat.swz == 0 || mat.swz == 8,
-                "exl3_cpu_dequant_bf16: the AVX2 planar packed layout (swz = 2) is not supported; "
-                "this tier targets the native/band-8 layouts (AVX-512 hosts)");
+    // mat.swz is the caller-ANDed band flag (0/1), not the group: the group for this rate decides
+    // the tile permutation, and the AVX2 group (2) implies the planar dword repack, which this
+    // scalar reference decode does not implement
+    TORCH_CHECK(!exl3_moe_cpu_planar_layout(K_tile),
+                "exl3_cpu_dequant_bf16: the AVX2 planar packed layout (band-2 rates on AVX2-only "
+                "hosts) is not supported; this tier targets the native/band-8 layouts");
+    const int grp = mat.swz ? exl3_moe_cpu_swizzle_group(K_tile) : 0;
     TORCH_CHECK(mat.k % 128 == 0 && mat.n % 128 == 0,
                 "exl3_cpu_dequant_bf16: in/out features must be multiples of 128 (Hadamard blocks), got ",
                 mat.k, "x", mat.n);
@@ -197,8 +200,8 @@ at::Tensor exl3_cpu_dequant_bf16
     {
 #define R_BF16_CASE(B)                                                    \
         case B:                                                           \
-            if (mat.hb) dequant_impl<B, true>(mat, wp);                   \
-            else dequant_impl<B, false>(mat, wp);                         \
+            if (mat.hb) dequant_impl<B, true>(mat, wp, grp);              \
+            else dequant_impl<B, false>(mat, wp, grp);                    \
             break;
         R_BF16_CASE(1) R_BF16_CASE(2) R_BF16_CASE(3) R_BF16_CASE(4)
         R_BF16_CASE(5) R_BF16_CASE(6) R_BF16_CASE(7) R_BF16_CASE(8)

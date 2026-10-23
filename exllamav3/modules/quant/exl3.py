@@ -54,6 +54,12 @@ _cpu_bf16_cache = None   # weakref-keyed on the LinearEXL3: buffers die with the
                          # cached entry can never outlive (and be reused for) another matrix
 
 
+def cpu_prefill_supported(inner) -> bool:
+    """The dequant reads the native or band-8 packed layout; rates that band to the AVX2 planar
+    layout (K1 on AVX-512 hosts, integer rates on AVX2-only hosts) stay on the stock mul1 path."""
+    return int(ext.exl3_moe_cpu_swizzle_group(float(inner.K))) in (0, 8)
+
+
 def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     from ...util import cuda_flags as _cf
     global _cpu_bf16_cache
@@ -130,7 +136,8 @@ def cpu_linear_forward_batch(linears, x, params, out_dtypes = None):
     # defers to the per-linear forwards (which tier individually) whenever it would engage
     from ...util import cuda_flags as _cf
     _tier_active = (_cf.cpu_prefill_tier() == "torch"
-                    and x.numel() // k >= _cf.cpu_prefill_min_m())
+                    and x.numel() // k >= _cf.cpu_prefill_min_m()
+                    and cpu_prefill_supported(linears[0].inner))
     eligible = x.is_contiguous() and not _tier_active
     if eligible:
         for i, l in enumerate(linears):
@@ -353,7 +360,8 @@ class LinearEXL3:
             dtype = out_dtype or self.default_out_dtype
             x2d = x.view(-1, self.in_features)
             from ...util import cuda_flags as _cf
-            if _cf.cpu_prefill_tier() == "torch" and x2d.shape[0] >= _cf.cpu_prefill_min_m():
+            if (_cf.cpu_prefill_tier() == "torch" and x2d.shape[0] >= _cf.cpu_prefill_min_m()
+                    and cpu_prefill_supported(self)):
                 y = cpu_prefill_torch_forward(self, x2d, dtype)
             else:
                 y = ext.exl3_cpu_linear_forward(
