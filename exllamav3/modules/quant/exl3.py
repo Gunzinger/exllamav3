@@ -52,6 +52,27 @@ _cpu_thp = os.name == "posix" and os.environ.get("EXL3_CPU_THP", "1") != "0"
 # never reaches this helper, so the stock path stays byte-identical.
 _cpu_bf16_cache = None   # weakref-keyed on the LinearEXL3: buffers die with their layer, and a
                          # cached entry can never outlive (and be reused for) another matrix
+_avx512_dequant = None   # resolved once: the AVX-512 kernel if importable+runnable, else False
+
+
+def _dequant_weights(inner, fp32_out: bool) -> torch.Tensor:
+    """Dequantized W [padded out, in]: AVX-512 kernel when available (bit-identical to the
+    scalar binding, ~50x its rate), scalar binding otherwise — also the only implementation
+    of the fp32_out parity variant. EXL3_CPU_PREFILL_AVX512=0 forces scalar (kill-switch)."""
+    global _avx512_dequant
+    if not fp32_out and os.environ.get("EXL3_CPU_PREFILL_AVX512", "1") != "0":
+        if _avx512_dequant is None:
+            _avx512_dequant = getattr(ext, "exl3_cpu_dequant_bf16_avx512", False)
+            if _avx512_dequant:
+                try:   # unsupported CPUs TORCH_CHECK inside the binding — probe once
+                    _avx512_dequant(inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz)
+                except RuntimeError:
+                    _avx512_dequant = False
+        if _avx512_dequant:
+            return _avx512_dequant(inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz)
+    return ext.exl3_cpu_dequant_bf16(
+        inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz, fp32_out
+    )
 
 
 def cpu_prefill_supported(inner) -> bool:
@@ -81,9 +102,7 @@ def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> t
         # keeps the weights fp32 (no bf16 rounding — the parity-fallback variant)
         from ...util import cuda_flags as _cf0
         _fp32 = _cf0.cpu_prefill_tier() == "fp32"
-        w = ext.exl3_cpu_dequant_bf16(
-            inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz, _fp32
-        )[:inner.out_features].contiguous()
+        w = _dequant_weights(inner, _fp32)[:inner.out_features].contiguous()
         if cache_bytes > 0 and w.numel() * w.element_size() <= cache_bytes:
             _cpu_bf16_cache[inner] = w
             # cumulative budget: evict least-recently-used whole tensors until we fit
