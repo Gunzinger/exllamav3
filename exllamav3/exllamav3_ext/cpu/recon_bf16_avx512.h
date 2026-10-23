@@ -11,9 +11,11 @@
 // binding, including the final fp32->BF16 round-to-nearest-even (integer conversion formula,
 // identical to c10::BFloat16's scalar rounding).
 //
-// Threading: independent 128x128 blocks, parallelized over n-block strips with
-// at::parallel_for (the ambient torch intra-op pool; torch.set_num_threads is the knob).
-// Blocks write disjoint output rows, so the result does not depend on the thread count.
+// Threading: independent 128x128 blocks, parallelized over n-block strips with a small
+// std::thread helper (the JIT CPU build has no -fopenmp, so at::parallel_for's inline OpenMP
+// path would run serial). Thread cap = at::get_num_threads() (OMP_NUM_THREADS /
+// torch.set_num_threads). Blocks write disjoint output rows, so the result does not depend
+// on the thread count.
 //
 // Host gating: AVX-512 F + BW + BF16. On anything else the call raises (TORCH_CHECK) with a
 // message pointing at the scalar binding; callers fall back to exl3_cpu_dequant_bf16.

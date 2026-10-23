@@ -25,6 +25,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <thread>
+#include <vector>
 
 #if defined(__GNUC__)
 #define RB16_TARGET __attribute__((target("avx512f,avx512bw,avx512vl,avx512dq,f16c")))
@@ -37,13 +39,11 @@ namespace {
 constexpr uint32_t R_MUL1_MULT = 0x83DCD12Du;
 constexpr float R_HAD_SCALE = 0.088388347648f;   // 1/sqrt(128), once per Hadamard pass
 
-inline float rb_k_inv()
-{
-    static const float v = static_cast<float>(c10::Half(uint16_t(0x1eee), c10::Half::from_bits()));
-    return v;
-}
-
 inline float rb_half_to_float(at::Half h) { return static_cast<float>(h); }
+
+// mul1 codebook scale (c10::Half 0x1EEE -> float), computed once at load: a function-local
+// static would add an init-guard check to every decode row
+static const float g_rb_k_inv = static_cast<float>(c10::Half(uint16_t(0x1eee), c10::Half::from_bits()));
 
 // ------------------------------------------------------------------ constexpr tables
 
@@ -86,26 +86,35 @@ constexpr std::array<RbSel, 4> g_ts_hi = { rb_ts_hi(0), rb_ts_hi(1), rb_ts_hi(2)
 // Per-rate decode tables. One tile row (n = tile n-offset) reads 16 slot states; slot
 // s = 32*(n&7) + 8*((k>>1)&3) + (k&1) + 2*((k>>3)&1) + 4*(n>>3) lives at ring bits
 // [b1-16, b1) with b1 = ((s+1)*rate2 >> 1) + 128*rate2; the scalar merges ring words
-// w[b0/32] << 32 | w[(b1-1)/32] and shifts right by 31 - ((b1-1) & 31). Both word indices
-// (F = (b1-16)>>5, L = (b1-1)>>5, each mod the ring length) and the shift are compile-time
-// constants per (rate, row, lane).
+// w[b0/32] << 32 | w[(b1-1)/32] and shifts right by 31 - ((b1-1) & 31). A row's 16 slots
+// span <= 27 consecutive slot indices -> <= 8 consecutive ring words (m(s) is monotone in
+// s), so instead of gathering per lane, both words are selected with in-register permutes
+// from ONE 16-word window of a per-tile extended ring copy; the window base and the
+// per-lane selectors/shifts are compile-time constants per (rate, row).
 template <int bits, bool hb>
 struct RbTabs
 {
     static constexpr int rate2 = 2 * bits + (hb ? 1 : 0);
     static constexpr int words32 = 4 * rate2;
 
-    struct Row { int32_t lo[16]; int32_t hi[16]; int32_t sh[16]; };
+    static constexpr int rb_slot(int n, int k)
+    {
+        return 32 * (n & 7) + 8 * ((k >> 1) & 3) + (k & 1) + 2 * ((k >> 3) & 1) + 4 * (n >> 3);
+    }
+    static constexpr int rb_b1(int s) { return (((s + 1) * rate2) >> 1) + 128 * rate2; }
+
+    struct Row { int32_t base; int32_t sel_lo[16]; int32_t sel_hi[16]; int32_t sh[16]; };
 
     static constexpr Row make_row(int n)
     {
         Row r{};
+        const int base = (rb_b1(rb_slot(n, 0)) - 1) / 32 - 1;    // window base (hi may need L-1)
+        r.base = base;
         for (int k = 0; k < 16; ++k)
         {
-            const int s = 32 * (n & 7) + 8 * ((k >> 1) & 3) + (k & 1) + 2 * ((k >> 3) & 1) + 4 * (n >> 3);
-            const int b1 = (((s + 1) * rate2) >> 1) + 128 * rate2;
-            r.lo[k] = ((b1 - 1) >> 5) % words32;     // word holding the window's last bit
-            r.hi[k] = ((b1 - 16) >> 5) % words32;    // word holding the window's first bit
+            const int b1 = rb_b1(rb_slot(n, k));
+            r.sel_lo[k] = (b1 - 1) / 32 - base;     // word holding the window's last bit
+            r.sel_hi[k] = (b1 - 16) / 32 - base;    // word holding the window's first bit
             r.sh[k] = 31 - ((b1 - 1) & 31);
         }
         return r;
@@ -118,19 +127,22 @@ struct RbTabs
         return a;
     }
     static constexpr std::array<Row, 16> rows = make_rows();
+
+    // Extended-ring length: slot indices wrap the ring exactly twice, so the highest row's
+    // window reaches word (b1(slot 228)-1)/32 + 16; ext = ring | ring | head mirrors that
+    static constexpr int ext_words = (rb_b1(rb_slot(15, 0)) - 1) / 32 + 17;
 };
 
 // ------------------------------------------------------------------ intrinsic helpers
 
 // 16 slot states of one tile row -> 16 mul1 codebook floats (integer-exact, then the scalar's
 // exact affine float conversion)
-RB16_TARGET inline __m512 rb_decode_row(const uint16_t* tile, const int32_t* lo, const int32_t* hi, const int32_t* sh)
+RB16_TARGET inline __m512 rb_decode_row(const uint32_t* ext, const int32_t* base, const int32_t* sel_lo, const int32_t* sel_hi, const int32_t* sh)
 {
-    const __m512i vlo = _mm512_loadu_si512(lo);
-    const __m512i vhi = _mm512_loadu_si512(hi);
+    const __m512i win = _mm512_loadu_si512(ext + *base);
+    const __m512i w_lo = _mm512_permutexvar_epi32(_mm512_loadu_si512(sel_lo), win);
+    const __m512i w_hi = _mm512_permutexvar_epi32(_mm512_loadu_si512(sel_hi), win);
     const __m512i vsh = _mm512_loadu_si512(sh);
-    const __m512i w_lo = _mm512_i32gather_epi32(vlo, tile, 4);
-    const __m512i w_hi = _mm512_i32gather_epi32(vhi, tile, 4);
     // state = ((w[L] >> sh) | (w[F] << (32 - sh))) & 0xFFFF; sh = 0 -> shift count 32 -> 0
     const __m512i inv = _mm512_sub_epi32(_mm512_set1_epi32(32), vsh);
     __m512i st = _mm512_or_si512(_mm512_srlv_epi32(w_lo, vsh), _mm512_sllv_epi32(w_hi, inv));
@@ -139,10 +151,13 @@ RB16_TARGET inline __m512 rb_decode_row(const uint16_t* tile, const int32_t* lo,
     const __m512i x = _mm512_mullo_epi32(st, _mm512_set1_epi32(static_cast<int32_t>(R_MUL1_MULT)));
     const __m512i msk = _mm512_set1_epi32(0x00FF00FF);
     const __m512i s16 = _mm512_add_epi32(_mm512_and_si512(x, msk), _mm512_and_si512(_mm512_srli_epi32(x, 8), msk));
-    const __m512i sum = _mm512_add_epi32(s16, _mm512_srli_epi32(s16, 16));
+    // s16 packs (b0+b1) in bits 0..8 and (b2+b3) in bits 16..24: the pair-sum halves must be
+    // masked apart before the final add, else the high half rides along scaled by 2^16
+    const __m512i sum = _mm512_add_epi32(_mm512_and_si512(s16, _mm512_set1_epi32(0xFFFF)),
+                                         _mm512_srli_epi32(s16, 16));
     __m512 v = _mm512_cvtepi32_ps(sum);
     v = _mm512_sub_ps(v, _mm512_set1_ps(510.0f));
-    return _mm512_mul_ps(v, _mm512_set1_ps(rb_k_inv()));
+    return _mm512_mul_ps(v, _mm512_set1_ps(g_rb_k_inv));
 }
 
 // One intra-vector Hadamard stage: t = partner lane's value; lanes with the stage bit clear get
@@ -191,9 +206,11 @@ RB16_TARGET inline void rb_had_scale_row(float* row)
 RB16_TARGET inline void rb_transpose16(__m512* a)
 {
     for (int k = 0; k < 4; ++k)
-        for (int i = 0; i < 16; i += 2 << k)
+        for (int i = 0; i < 16; ++i)
         {
-            const int j = i + (1 << k);
+            const int b = 1 << k;
+            if (i & b) continue;        // pair every m with bit k clear against m ^ b
+            const int j = i + b;
             const __m512 x = _mm512_permutex2var_ps(a[i], _mm512_loadu_si512(g_ts_lo[k].v), a[j]);
             const __m512 y = _mm512_permutex2var_ps(a[i], _mm512_loadu_si512(g_ts_hi[k].v), a[j]);
             a[i] = x;
@@ -261,13 +278,18 @@ RB16_TARGET void dequant_impl_avx
                     const size_t stored = g
                         ? static_cast<size_t>(ntl / g) * tiles_k * g + static_cast<size_t>(ktl) * g + (ntl % g)
                         : static_cast<size_t>(ktl) * tiles_n + ntl;    // native: [k/16, n/16, words]
-                    const uint16_t* tile = mat.trellis + stored * words;
+                    // per-tile extended ring (ring | ring | head): the rows' 16-word windows
+                    // index it directly, no per-lane mod
+                    const uint32_t* ring = reinterpret_cast<const uint32_t*>(mat.trellis + stored * words);
+                    uint32_t ext[Tabs::ext_words];
+                    for (int i = 0; i < Tabs::words32; ++i) ext[i] = ring[i];
+                    for (int i = Tabs::words32; i < Tabs::ext_words; ++i) ext[i] = ext[i - Tabs::words32];
                     float* base = blk + static_cast<size_t>(nt) * 16 * 128 + kt * 16;
                     for (int row = 0; row < 16; ++row)
                     {
                         const auto& tb = Tabs::rows[row];
                         _mm512_store_ps(base + static_cast<size_t>(row) * 128,
-                                        rb_decode_row(tile, tb.lo, tb.hi, tb.sh));
+                                        rb_decode_row(ext, &tb.base, tb.sel_lo, tb.sel_hi, tb.sh));
                     }
                 }
             // k-side Hadamard per block row (contiguous), scale once
@@ -302,6 +324,36 @@ inline bool rb_host_ok()
 #else
     return false;
 #endif
+}
+
+// Block-strip parallelism over std::thread. The JIT CPU build compiles without -fopenmp, and
+// the inline at::parallel_for from <ATen/ParallelOpenMP.h> then silently drops its omp pragmas
+// and runs serial, so the strip loop needs its own workers. Thread cap = at::get_num_threads()
+// (torch's intra-op setting: OMP_NUM_THREADS / torch.set_num_threads). Items are independent
+// 128-row strips, so the split is deterministic for any thread count. The task lambda must
+// not throw (a worker exception would terminate the process); the kernel is noexcept.
+template <class F>
+inline void rb_parallel_for(int n_items, F&& fn)
+{
+    int nt = at::get_num_threads();
+    if (nt > n_items) nt = n_items;
+    if (nt < 2 || n_items < 2)
+    {
+        fn(0, n_items);
+        return;
+    }
+    const int chunk = (n_items + nt - 1) / nt;
+    std::vector<std::thread> workers;
+    workers.reserve(nt - 1);
+    for (int w = 1; w < nt; ++w)
+    {
+        const int b = w * chunk;
+        const int e = std::min(n_items, b + chunk);
+        if (b >= e) break;
+        workers.emplace_back([&fn, b, e]() { fn(b, e); });
+    }
+    fn(0, std::min(n_items, chunk));
+    for (auto& t : workers) t.join();
 }
 
 }  // namespace
@@ -349,11 +401,11 @@ at::Tensor exl3_cpu_dequant_bf16_avx512
 #define R_BF16X_CASE(B)                                                          \
         case B:                                                                  \
             if (mat.hb)                                                          \
-                at::parallel_for(0, mat.n / 128, 1, [&](int64_t b, int64_t e)    \
-                { dequant_impl_avx<B, true>(mat, op, (int) b * 128, (int) e * 128, grp); });   \
+                rb_parallel_for(mat.n / 128, [&](int b, int e)                   \
+                { dequant_impl_avx<B, true>(mat, op, b * 128, e * 128, grp); }); \
             else                                                                 \
-                at::parallel_for(0, mat.n / 128, 1, [&](int64_t b, int64_t e)    \
-                { dequant_impl_avx<B, false>(mat, op, (int) b * 128, (int) e * 128, grp); });  \
+                rb_parallel_for(mat.n / 128, [&](int b, int e)                   \
+                { dequant_impl_avx<B, false>(mat, op, b * 128, e * 128, grp); });\
             break;
         R_BF16X_CASE(1) R_BF16X_CASE(2) R_BF16X_CASE(3) R_BF16X_CASE(4)
         R_BF16X_CASE(5) R_BF16X_CASE(6) R_BF16X_CASE(7) R_BF16X_CASE(8)
