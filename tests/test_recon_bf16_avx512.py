@@ -20,7 +20,16 @@ Usage (own extension cache so concurrent agents' builds never race):
     /home/daniel/development/gunzi/local-llm/cpu-trial/.venv/bin/python tests/test_recon_bf16_avx512.py
 
 RESUME.md (status log; append the next step if interrupted):
-  [2026-10-24] kernel + binding + cuda_flags line landed; first run pending JIT build.
+  [2026-10-24] DONE — kernel landed (bb87f5bf + c749113b): bit-identical to the scalar binding
+  at every K x layout (13 cases incl. a 512x256 multi-block band-8 arm); cold 4096x4096 K=2.5
+  ~4.2 GB/s vs ~90 MB/s scalar (48x; acceptance was 8x / 400 MB/s). Not yet done: python-side
+  tier dispatch does not call the avx512 binding yet (the other agent owns exl3.py); the
+  fp32_out variant of the scalar binding has no avx512 twin (by design — bf16-out kernel).
+  Debugging lore if this ever breaks: (1) SWAR byte-sum needs (s16 & 0xFFFF) + (s16 >> 16),
+  the unmasked add silently rides the high pair-sum at 2^16; (2) the 16x16 transpose's stage k
+  must pair EVERY m with bit k clear against m ^ 2^k (stepping i by 2^(k+1) skips half the
+  pairs); (3) the JIT CPU build has no -fopenmp, so at::parallel_for silently runs serial —
+  use the file's rb_parallel_for (std::thread) helper for block parallelism.
 """
 import os
 import sys

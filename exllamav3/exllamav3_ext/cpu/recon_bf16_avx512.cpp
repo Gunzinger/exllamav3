@@ -2,9 +2,11 @@
 // See recon_bf16_avx512.h for the contract. This file shares the scalar reference's format
 // tables and math (recon_bf16.cpp) but executes it 16 lanes wide:
 //
-//   - state decode: integer-exact. Per tile row, 16 slot states come out of two vgatherdd's
-//     over the tile's u32 ring (the (w[F] << 32 | w[L]) merged-word trick of the scalar decode,
-//     folded into per-lane srlv/sllv variable shifts). The slot permutation is the closed form
+//   - state decode: integer-exact. Per tile, the u32 bit ring is mirrored once into a small
+//     extended buffer (ring | ring | head, constants per rate); each tile row's 16 slot states
+//     then come out of ONE unaligned 16-word window load + two in-register permutes and
+//     per-lane variable shifts (the (w[F] << 32 | w[L]) merged-word trick of the scalar
+//     decode, folded into srlv/sllv). The slot permutation is the closed form
 //     slot(n, k) = 32*(n&7) + 8*((k>>1)&3) + (k&1) + 2*((k>>3)&1) + 4*(n>>3)
 //     == g_tc_inv[k*16 + n] (verified against recon_bf16.cpp's constexpr inverse table).
 //   - mul1 codebook: byte-sum via the exact (b0+b1)+(b2+b3) SWAR reduce; the affine float
