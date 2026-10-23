@@ -165,6 +165,18 @@ def test_dequant_parity():
             assert (strict | floor).all(), f"K={K} swz={swz}: element exceeds 1-ulp class AND the 1e-7 floor"
             assert n_floor <= max(1, err.numel() // 1000), f"K={K} swz={swz}: {n_floor} elements need the floor (>0.1%)"
     print(f"    worst: {worst:.3f} bf16-ulp  (<= 1-ulp class incl. fp32 accumulation-order noise)")
+    # fp32_out variant (tier "fp32"): no bf16 rounding at all — only the cross-order fp32
+    # butterfly noise remains (measured class ~1e-6 absolute on O(1)-scale weights)
+    os.environ["EXL3_MOE_CPU_SWIZZLE"] = "0"
+    try:
+        trellis, suh, svh, Kf, swz = make_linear(K=4, seed=44)
+        w32 = ext.exl3_cpu_dequant_bf16(trellis, suh, svh, Kf, swz, True)
+    finally:
+        os.environ.pop("EXL3_MOE_CPU_SWIZZLE", None)
+    ref32 = dequant_weight_fp32(trellis, suh, svh, grp=0).t()
+    e32 = (w32.float() - ref32).abs().max().item()
+    print(f"    fp32_out: dtype {w32.dtype}, max-abs {e32:.3e} (cross-order fp32 noise class)")
+    assert w32.dtype == torch.float32 and e32 <= 1e-5, "fp32_out dequant out of fp32-noise class"
 
 
 # --------------------------------------------------------------------------- (b)

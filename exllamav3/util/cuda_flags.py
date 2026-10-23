@@ -64,6 +64,7 @@ CPU_SOURCES = [
     "cpu/moe_mul1.cpp",
     "cpu/linear_mul1.cpp",
     "cpu/recon_bf16.cpp",
+    "cpu/recon_bf16_avx512.cpp",
     "cpu/hc_mix_cpu.cpp",
     "cpu/gdn_step_cpu.cpp",
     "cpu/sdpa_paged_cpu.cpp",
@@ -332,7 +333,7 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
 # -------------------------------------------------------------------------------------------
 def cpu_prefill_tier() -> str:
     v = os.environ.get("EXL3_CPU_PREFILL_TIER", "off").strip().lower()
-    return v if v in ("off", "torch") else "off"
+    return v if v in ("off", "torch", "fp32") else "off"
 
 
 def cpu_prefill_min_m() -> int:

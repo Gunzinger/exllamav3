@@ -25,13 +25,11 @@ TEXT = ("The history of computing machinery begins with mechanical aids and unfo
 WORDS = TEXT.split()
 
 
-def prefill_once(model, tokenizer, ctx, n_tokens, seed):
-    from exllamav3 import Cache, Generator, Job
+def prefill_once(gen, tokenizer, ctx, n_tokens, seed):
+    from exllamav3 import Job
     g = torch.Generator().manual_seed(seed)
     words = [WORDS[i % len(WORDS)] for i in torch.randint(0, len(WORDS), (n_tokens // 2 + 2,), generator=g)]
     ids = tokenizer.encode(" ".join(words), add_bos=True, encode_special_tokens=True)[:, :n_tokens]
-    cache = Cache(model, max_num_tokens=ctx, max_batch_size=1, max_history=0)
-    gen = Generator(model, cache, tokenizer)
     job = Job(input_ids=ids, max_new_tokens=1, identifier=1)   # prefill-only
     gen.enqueue(job)
     t0 = time.perf_counter()
@@ -53,11 +51,13 @@ def main():
     torch.set_num_threads(12)
     os.environ.setdefault("EXL3_MOE_CPU_THREADS", "10")
 
-    from exllamav3 import Config, Model, Tokenizer
+    from exllamav3 import Config, Model, Tokenizer, Cache, Generator
     t0 = time.perf_counter()
     config = Config.from_directory(MODEL_DIR)
     model = Model.from_config(config)
     tokenizer = Tokenizer.from_config(config)
+    cache = Cache(model, max_num_tokens=args.ctx, max_batch_size=1, max_history=0)
+    gen = Generator(model, cache, tokenizer)
     model.load(torch.device("cpu"))
     print(f"[load] {time.perf_counter() - t0:.1f}s", flush=True)
 
@@ -70,7 +70,7 @@ def main():
             os.environ.pop("EXL3_CPU_PREFILL_CACHE_MIB", None)
         times = []
         for r in range(args.rounds):
-            dt, n = prefill_once(model, tokenizer, args.ctx, args.tokens, seed=100 + r)
+            dt, n = prefill_once(gen, tokenizer, args.ctx, args.tokens, seed=100 + r)
             times.append(dt)
             print(f"[{arm}] round {r}: {n} tokens in {dt:.2f}s -> {n / dt:.2f} tok/s", flush=True)
         steady = args.tokens / min(times[1:])

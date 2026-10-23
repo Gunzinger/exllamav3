@@ -77,9 +77,12 @@ def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> t
             w = entry
     if w is None:
         # One dequant per (layer tensor, cache epoch); the padded tile columns beyond
-        # out_features are dropped so the matmul only produces real outputs
+        # out_features are dropped so the matmul only produces real outputs. tier "fp32"
+        # keeps the weights fp32 (no bf16 rounding — the parity-fallback variant)
+        from ...util import cuda_flags as _cf0
+        _fp32 = _cf0.cpu_prefill_tier() == "fp32"
         w = ext.exl3_cpu_dequant_bf16(
-            inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz
+            inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz, _fp32
         )[:inner.out_features].contiguous()
         if cache_bytes > 0 and w.numel() * w.element_size() <= cache_bytes:
             _cpu_bf16_cache[inner] = w
@@ -87,7 +90,7 @@ def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> t
             used = lambda: sum(v.numel() * v.element_size() for v in _cpu_bf16_cache.values())
             while used() > cache_bytes and len(_cpu_bf16_cache) > 1:
                 _cpu_bf16_cache.pop(next(iter(_cpu_bf16_cache)))
-    y = torch.matmul(x2d.to(torch.bfloat16), w.t())
+    y = torch.matmul(x2d.to(w.dtype), w.t())
     y = y.float()
     if inner.bias is not None:
         y += inner.bias.float()
@@ -145,7 +148,7 @@ def cpu_linear_forward_batch(linears, x, params, out_dtypes = None):
     # defers to the per-linear forwards (which tier individually) whenever it would engage
     from ...util import cuda_flags as _cf
     _l0_inner = getattr(linears[0], "inner", linears[0])   # entries may be bare LinearEXL3
-    _tier_active = (_cf.cpu_prefill_tier() == "torch"
+    _tier_active = (_cf.cpu_prefill_tier() != "off"
                     and x.numel() // k >= _cf.cpu_prefill_min_m()
                     and cpu_prefill_supported(_l0_inner))
     eligible = x.is_contiguous() and not _tier_active
@@ -370,7 +373,7 @@ class LinearEXL3:
             dtype = out_dtype or self.default_out_dtype
             x2d = x.view(-1, self.in_features)
             from ...util import cuda_flags as _cf
-            if (_cf.cpu_prefill_tier() == "torch" and x2d.shape[0] >= _cf.cpu_prefill_min_m()
+            if (_cf.cpu_prefill_tier() != "off" and x2d.shape[0] >= _cf.cpu_prefill_min_m()
                     and cpu_prefill_supported(self)):
                 y = cpu_prefill_torch_forward(self, x2d, dtype)
             else:

@@ -169,7 +169,8 @@ at::Tensor exl3_cpu_dequant_bf16
     const at::Tensor& suh,
     const at::Tensor& svh,
     double K,
-    bool swizzled
+    bool swizzled,
+    bool fp32_out
 )
 {
     TORCH_CHECK(trellis.device().is_cpu() && suh.device().is_cpu() && svh.device().is_cpu(),
@@ -213,6 +214,10 @@ at::Tensor exl3_cpu_dequant_bf16
         default: TORCH_CHECK(false, "exl3_cpu_dequant_bf16: unsupported bitrate ", mat.bits);
     }
 
+    // fp32_out: return the fp32 dequant directly (the fp32-GEMM tier variant — no bf16
+    // rounding of the weights; the bf16 narrow below is skipped)
+    if (fp32_out) return wf;
+
     // fp32 dequant -> BF16, round-to-nearest-even (c10::BFloat16's scalar conversion), emitted
     // as u16 payloads — Zen 5 has no AVX512_FP16 and the vectorized narrow is deferred perf work
     at::Tensor out = at::empty({mat.n, mat.k},
@@ -233,6 +238,7 @@ at::Tensor exl3_cpu_dequant_bf16
     const at::Tensor&,
     const at::Tensor&,
     double,
+    bool,
     bool
 )
 {

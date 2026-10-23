@@ -25,5 +25,6 @@ at::Tensor exl3_cpu_dequant_bf16
     const at::Tensor& suh,
     const at::Tensor& svh,
     double K,
-    bool swizzled
+    bool swizzled,
+    bool fp32_out = false
 );
