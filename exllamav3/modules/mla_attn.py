@@ -49,8 +49,10 @@ assert _score_tile % 256 == 0 and _score_tile > 0
 # prefill chunk, or a graph-captured decode step -- see bc_mla_step) rebuilds every complete
 # pool in one batched pass from the cached idx-key plane. A pool's key is a pure function of
 # the plane's packed [k || gate] rows plus the constant APE, and complete pools are immutable,
-# so the rebuild is exact (bit-identical, same arithmetic over the same rows).
-_dsa_lazy_planes = os.environ.get("EXL3_DSA_LAZY_PLANES", "0") == "1"
+# so the rebuild is exact (bit-identical, same arithmetic over the same rows). Default ON:
+# the synthetic harness (test_dsa_lazy_planes.py) proves bit-exact state equality old-vs-new
+# across both crossing flavors; the deferred 3-regime model parity gate governs the merge.
+_dsa_lazy_planes = os.environ.get("EXL3_DSA_LAZY_PLANES", "1") == "1"
 
 # Part B step 1: batch the two dense-MHA up-projection GEMMs into one (kv_b halves
 # concatenated on the N dim, split views after, strides handed to the attention kernel)
