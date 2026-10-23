@@ -344,6 +344,6 @@ def cpu_prefill_min_m() -> int:
 
 def cpu_prefill_cache_bytes() -> int:
     try:
-        return max(0, int(os.environ.get("EXL3_CPU_PREFILL_CACHE_BYTES", str(2 * 1024**3))))
+        return max(0, int(os.environ.get("EXL3_CPU_PREFILL_CACHE_MIB", "0"))) * 1024**2
     except ValueError:
-        return 2 * 1024**3
+        return 0

@@ -104,61 +104,61 @@ void dequant_impl(const MoeCpuMatrix& mat, float* w, int g)
     constexpr int words = 8 * rate_k2(bits, hb);
     const int tiles_k = mat.k / 16;
     const int tiles_n = mat.n / 16;
-    const size_t ring = words;
 
-    // Decode: tile (kt, nt) covers out-rows nt*16..+16 and in-cols kt*16..+16; weight (row, col)
-    // lives in tile slot g_tc_inv[row * 16 + col]. The packed layout permutes tiles within
-    // g-groups: stored index (nt/g) * tiles_k * g + kt * g + nt % g.
-    for (int nt = 0; nt < tiles_n; ++nt)
-        for (int kt = 0; kt < tiles_k; ++kt)
+    // Blocked decode: each 128x128 block is decoded into a 64 KiB L2-resident buffer, gets
+    // BOTH Hadamard passes and the diagonal scales in-cache, and is written out contiguously.
+    // (A whole-matrix n-side butterfly strides mat.k floats - one cache line + likely one TLB
+    // entry per element, measured ~12 MB/s end-to-end; the block form is bound by the decode.)
+    //
+    // Tile (kt, nt) covers out-rows nt*16..+16 and in-cols kt*16..+16; the weight at
+    // (n_off, k_off) lives in tile slot g_tc_inv[k_off * 16 + n_off] - the oracle's reshape
+    // (val[:, :, inv] -> 16x16, k-side major) fixes the slot's orientation. The packed layout
+    // permutes tiles within g-groups: stored (nt/g) * tiles_k * g + kt * g + nt % g.
+    alignas(64) float blk[128 * 128];
+    for (int n0 = 0; n0 < mat.n; n0 += 128)
+        for (int k0 = 0; k0 < mat.k; k0 += 128)
         {
-            const size_t stored = g
-                ? static_cast<size_t>(nt / g) * tiles_k * g + static_cast<size_t>(kt) * g + (nt % g)
-                : static_cast<size_t>(kt) * tiles_n + nt;   // native: trellis is [k/16, n/16, words]
-            const uint16_t* tile = mat.trellis + stored * words;
-            float* base = w + static_cast<size_t>(nt * 16) * mat.k + static_cast<size_t>(kt) * 16;
-            for (int row = 0; row < 16; ++row)
-            {
-                float* out_row = base + static_cast<size_t>(row) * mat.k;
-                for (int col = 0; col < 16; ++col)
+            for (int nt = n0 / 16, nte = nt + 8; nt < nte; ++nt)
+                for (int kt = k0 / 16, kte = kt + 8; kt < kte; ++kt)
                 {
-                    const int t = g_tc_inv[col * 16 + row];   // slot is k-major: weight (n_off, k_off) -> slot g_tc_inv[k_off*16 + n_off]
-                    out_row[col] = decode_mul1_scalar(decode_state_scalar<bits, hb>(tile, t));
+                    const size_t stored = g
+                        ? static_cast<size_t>(nt / g) * tiles_k * g + static_cast<size_t>(kt) * g + (nt % g)
+                        : static_cast<size_t>(kt) * tiles_n + nt;   // native: [k/16, n/16, words]
+                    const uint16_t* tile = mat.trellis + stored * words;
+                    float* base = blk + static_cast<size_t>(nt - n0 / 16) * 16 * 128
+                                + static_cast<size_t>(kt - k0 / 16) * 16;
+                    for (int row = 0; row < 16; ++row)          // row = n_off within the tile
+                    {
+                        float* out_row = base + static_cast<size_t>(row) * 128;
+                        for (int col = 0; col < 16; ++col)      // col = k_off within the tile
+                        {
+                            const int t = g_tc_inv[col * 16 + row];   // slot is k-major
+                            out_row[col] = decode_mul1_scalar(decode_state_scalar<bits, hb>(tile, t));
+                        }
+                    }
                 }
+            // k-side Hadamard per block row (contiguous), scale once
+            for (int r = 0; r < 128; ++r)
+            {
+                hadamard_128_stride(blk + r * 128, 1);
+                for (int i = 0; i < 128; ++i) blk[r * 128 + i] *= R_HAD_SCALE;
+            }
+            // n-side Hadamard per block column (stride 128 within the resident block), scale once
+            for (int c = 0; c < 128; ++c)
+            {
+                hadamard_128_stride(blk + c, 128);
+                for (int i = 0; i < 128; ++i) blk[i * 128 + c] *= R_HAD_SCALE;
+            }
+            // Diagonal scales strictly AFTER both butterflies (file header): suh per in-column,
+            // svh per out-row, fused into the contiguous block write
+            for (int r = 0; r < 128; ++r)
+            {
+                const float sv = half_to_float(mat.svh[n0 + r]);
+                float* out_row = w + static_cast<size_t>(n0 + r) * mat.k + k0;
+                for (int c = 0; c < 128; ++c)
+                    out_row[c] = blk[r * 128 + c] * sv * half_to_float(mat.suh[k0 + c]);
             }
         }
-
-    // k-side Hadamard per 128-block, scale once
-    for (int k0 = 0; k0 < mat.k; k0 += 128)
-        for (int n = 0; n < mat.n; ++n)
-        {
-            float* v = w + static_cast<size_t>(n) * mat.k + k0;
-            hadamard_128_stride(v, 1);
-            for (int i = 0; i < 128; ++i) v[i] *= R_HAD_SCALE;
-        }
-
-    // Diagonal scales strictly AFTER both butterflies: the kernel-equivalent weight is
-    // W = (H @ what @ H) * (suh ⊗ svh) / 128 (oracle: cpu-trial/tests/test_linear_cpu.py —
-    // gates the real mul1 kernels; a diagonal does not commute with the Hadamard, so folding
-    // suh/svh in before the butterflies is a structural error, not a rounding one)
-
-    // n-side Hadamard per 128-block (output-side transform), scale once
-    for (int n0 = 0; n0 < mat.n; n0 += 128)
-        for (int k = 0; k < mat.k; ++k)
-        {
-            float* v = w + static_cast<size_t>(n0) * mat.k + k;
-            hadamard_128_stride(v, mat.k);
-            for (int i = 0; i < 128; ++i) v[static_cast<size_t>(i) * mat.k] *= R_HAD_SCALE;
-        }
-
-    // suh (per in-column) and svh (per out-row) applied after both passes, one sweep
-    for (int n = 0; n < mat.n; ++n)
-    {
-        const float sv = half_to_float(mat.svh[n]);
-        float* row = w + static_cast<size_t>(n) * mat.k;
-        for (int k = 0; k < mat.k; ++k)
-            row[k] *= sv * half_to_float(mat.suh[k]);
-    }
 }
 
 }  // namespace

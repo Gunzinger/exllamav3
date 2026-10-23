@@ -69,7 +69,12 @@ def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> t
         if _cpu_bf16_cache is None:
             import weakref
             _cpu_bf16_cache = weakref.WeakKeyDictionary()
-        w = _cpu_bf16_cache.get(inner)
+        entry = _cpu_bf16_cache.get(inner)
+        if entry is not None:
+            # LRU refresh (pop+reinsert moves the key to the most-recent end); keys are
+            # weakrefs so a model unload drops its whole entry set
+            _cpu_bf16_cache[inner] = _cpu_bf16_cache.pop(inner)
+            w = entry
     if w is None:
         # One dequant per (layer tensor, cache epoch); the padded tile columns beyond
         # out_features are dropped so the matmul only produces real outputs
@@ -78,6 +83,10 @@ def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> t
         )[:inner.out_features].contiguous()
         if cache_bytes > 0 and w.numel() * w.element_size() <= cache_bytes:
             _cpu_bf16_cache[inner] = w
+            # cumulative budget: evict least-recently-used whole tensors until we fit
+            used = lambda: sum(v.numel() * v.element_size() for v in _cpu_bf16_cache.values())
+            while used() > cache_bytes and len(_cpu_bf16_cache) > 1:
+                _cpu_bf16_cache.pop(next(iter(_cpu_bf16_cache)))
     y = torch.matmul(x2d.to(torch.bfloat16), w.t())
     y = y.float()
     if inner.bias is not None:
