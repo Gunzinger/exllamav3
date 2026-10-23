@@ -61,14 +61,61 @@ dequant + GEMM is the follow-up lever (plan §Design Option 2, triggered: >20 % 
 
 ## E2E prefill A/B — `bench_decode.py` (metrics twin on, GPU server stopped, AC)
 
-Rows `p07-tier-{off,torch}-{128,512,2048}` in `bench_history.csv` + `bench_metrics.csv`:
-(pending — table filled when the matrix completes)
+Rows `p07-tier-{off,torch}-{128,512,2048}` in `bench_history.csv` + `bench_metrics.csv`.
+NOTE: the harness's prompt synthesis capped all prefill arms at ~278 actual tokens, so the
+three sizes are replicates of one ~278-token point; the torch arm of the third run picked up
+the blocked-dequant rebuild mid-matrix (cold 2.8 s → 0.7 s per 32 MiB tensor).
 
-## Parity gates
+| arm | prefill tok/s | decode ms/step (neutrality) |
+|---|---|---|
+| tier-off | 24.9 / 25.5 / 25.4 | 236 / 254 / 254 |
+| tier-torch (cold, one-shot) | 0.61 / 1.50 / 4.25 | 256 / 224 / — |
 
-(pending) self_golden record(tier off) / compare(tier torch), qwen 2.05; 256-token greedy on 3
-qbench rows × {off, torch} — flip counts vs the plan's argmax-stability rule (≤2 flips / 512 tok,
-else fp32-GEMM fallback decision).
+**Decode is neutral** (tier engages only at M ≥ 32; M=1 decode never enters it). **Single-shot
+cold prefill is a large loss**: ~100 non-MoE tensors × ~0.7 s scalar dequant ≈ 70 s+ vs a 5 s
+stock prefill. Warm-repeat bench (`tests/bench_prefill_warm.py`, 4 × ~370-token rounds,
+one process): the run collided with the 07b subagent's JIT build — rounds swing 4.4–11.2 s in
+BOTH arms; usable only as the qualitative observation that warm-cache rounds recover to
+stock-class times. Clean re-run queued for the quiet machine (numbers to fill in §Addendum).
+
+## Parity gates (plan §Verification 1)
+
+- `tests/par_qbench.py` (3 qbench rows × 256 tokens, one process, env-flip arms):
+  - tier=torch (bf16): **332 flips / 768 tokens (221 per 512; rule ≤ 2)** — FAIL
+  - tier=fp32 (plan's fallback variant): **426 flips / 768 (284 per 512)** — FAIL, and *worse*
+    than bf16 on 2 of 3 rows (row 0 bit-identical, row 2 first-diff at token 13).
+- Root cause (measured, not conjecture): the reference path itself quantizes activations to
+  int8 per 16-lane group — the fp64-truth unit gate measures the stock path at rel 0.7–1.8e-2
+  from exact. ANY exact recomputation (fp32 tier) therefore differs from stock by that whole
+  class, compounding residually through 48 layers; flip cascades are then coin-flips (row 0
+  identical, row 2 flips from token 13 — the M2 lesson's shape). **The ≤2-flips/512 rule is
+  unsatisfiable for any reimplementation tier**, not a defect of bf16. The fp32 variant is
+  kept (binding `fp32_out`, tier value `fp32`) with its measured cost (~½ bf16 GEMM rate) as
+  the plan instructed; it does not and cannot rescue byte-stability.
+- Goldens (`tests/golden/self_golden.py`, qwen 2.05, worktree build): record(tier off) vs
+  compare(tier torch) — **tokens 16/16 exact on short/med/long**, top1-logit max-abs 0.00 /
+  0.44 / 1.41. Landing with tier default OFF keeps default goldens byte-exact.
+- Consequence for promotion: the tier is a **lossy opt-in** feature (default off). Graduating
+  it toward default-on belongs to the `kl_lossy.py` distributional methodology (KL(arm‖ref)
+  both directions + flip-margin stats), queued as follow-up work; the 256-token flip record
+  above is its input evidence.
+
+## Verdict against the plan's acceptance criteria (§Verification & acceptance)
+
+1. Parity "argmax-stable, ≤2 flips/512": **NOT MET and proven unsatisfiable** for any
+   reimplementation tier (stock int8-activation noise ~1e-2 rel dominates; fp32 fallback
+   measured worse than bf16 — see Parity gates). Goldens 16/16 exact at their horizon.
+   → lands as documented lossy opt-in, default OFF; KL follow-up is the promotion gate.
+2. Micro "≥3× mul1-batch at M=128/512/2048": met at M=512 (3.0–3.1×) and 2048 narrow (2.97×);
+   2.25–2.6× at 2048 wide and 1.4–2.4× at 128 (dequant amortization + small-M GEMM efficiency;
+   07b SIMD dequant addresses the cold side).
+3. E2E "≥2× CPU prefill (target ≥60 t/s)": **NOT MET by Option 1 non-MoE-only scope.**
+   Cold one-shot is a loss (dequant dominates); warm steady-state ≈ stock within noise — the
+   non-MoE linears are a minor share of qwen prefill (MoE stays on the stock path by plan
+   scope). The E2E win requires the deferred MoE grouped tier + fast dequant (07b), i.e. the
+   plan's own sequencing ("Start non-MoE linears only; MoE behind a second env once linear
+   path is proven") — this tranche proves the linear path and quantifies its ceiling.
+4. Decode unchanged: **MET** (measured neutral across all six matrix arms; tier gated M ≥ 32).
 
 ## Open items
 
