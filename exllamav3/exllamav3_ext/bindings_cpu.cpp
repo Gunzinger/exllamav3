@@ -12,6 +12,7 @@
 #include "stloader.h"
 #include "hadamard.h"
 #include "cpu/moe_mul1.h"
+#include "cpu/recon_bf16.h"
 #include "cpu/hc_mix_cpu.h"
 #include "cpu/gdn_step_cpu.h"
 #include "cpu/sdpa_paged_cpu.h"
@@ -130,6 +131,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "exl3_cpu_linear_forward_batch",
           py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("bias"),
           py::arg("x"), py::arg("want_fp32_out"), py::arg("swizzled"),
+          py::call_guard<py::gil_scoped_release>());
+    m.def("exl3_cpu_dequant_bf16", &exl3_cpu_dequant_bf16, "exl3_cpu_dequant_bf16",
+          py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("K"), py::arg("swizzled") = false,
           py::call_guard<py::gil_scoped_release>());
 
     #include "sam_bc.h"

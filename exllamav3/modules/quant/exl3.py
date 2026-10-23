@@ -40,6 +40,44 @@ def _swizzle_mallopt():
 # 2 MiB pages for the CPU-resident trellis (TLB reach on the GEMV streams); best effort
 _cpu_thp = os.name == "posix" and os.environ.get("EXL3_CPU_THP", "1") != "0"
 
+
+# -------------------------------------------------------------------------------------------
+# CPU prefill tier (Plan 07 Option 1, opt-in): at M >= EXL3_CPU_PREFILL_MIN_M the dense linear
+# dequantizes its trellis once to a BF16 buffer (ext.exl3_cpu_dequant_bf16) and takes
+# torch.matmul (oneDNN) instead of the decode-shape mul1 GEMV. Output dtype contract matches
+# the mul1 path (fp32 accumulation + fp32 bias add, single rounding to the caller's dtype);
+# values differ from the old path by the bf16 weight rounding where the old path instead has
+# int8 activation-quantization noise — tolerance/argmax acceptance, PLAN-cpu-bf16-prefill.md.
+# Env knobs live in util/cuda_flags.py (EXL3_CPU_PREFILL_TIER / _MIN_M / _CACHE_BYTES); "off"
+# never reaches this helper, so the stock path stays byte-identical.
+_cpu_bf16_cache = None   # weakref-keyed on the LinearEXL3: buffers die with their layer, and a
+                         # cached entry can never outlive (and be reused for) another matrix
+
+
+def cpu_prefill_torch_forward(inner, x2d: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    from ...util import cuda_flags as _cf
+    global _cpu_bf16_cache
+    cache_bytes = _cf.cpu_prefill_cache_bytes()
+    w = None
+    if cache_bytes > 0:
+        if _cpu_bf16_cache is None:
+            import weakref
+            _cpu_bf16_cache = weakref.WeakKeyDictionary()
+        w = _cpu_bf16_cache.get(inner)
+    if w is None:
+        # One dequant per (layer tensor, cache epoch); the padded tile columns beyond
+        # out_features are dropped so the matmul only produces real outputs
+        w = ext.exl3_cpu_dequant_bf16(
+            inner.trellis, inner.suh, inner.svh, inner.K, inner.cpu_swz
+        )[:inner.out_features].contiguous()
+        if cache_bytes > 0 and w.numel() * w.element_size() <= cache_bytes:
+            _cpu_bf16_cache[inner] = w
+    y = torch.matmul(x2d.to(torch.bfloat16), w.t())
+    y = y.float()
+    if inner.bias is not None:
+        y += inner.bias.float()
+    return y if dtype == torch.float else y.to(torch.half)
+
 if _cpu_thp:
     import ctypes as _ct
 
@@ -88,7 +126,12 @@ def cpu_linear_forward_batch(linears, x, params, out_dtypes = None):
     scalers, trimmed outputs, non-CPU tensors)."""
     ovr = params.get("ovr") if isinstance(params, dict) else None
     k = x.shape[-1]
-    eligible = x.is_contiguous()
+    # The prefill tier changes per-linear semantics at M >= min, so the batched decode path
+    # defers to the per-linear forwards (which tier individually) whenever it would engage
+    from ...util import cuda_flags as _cf
+    _tier_active = (_cf.cpu_prefill_tier() == "torch"
+                    and x.numel() // k >= _cf.cpu_prefill_min_m())
+    eligible = x.is_contiguous() and not _tier_active
     if eligible:
         for i, l in enumerate(linears):
             inner = getattr(l, "inner", None)
@@ -308,10 +351,15 @@ class LinearEXL3:
                 f"LinearEXL3 {self.key}: CPU forward supports the mul1 codebook only (mcg is unsupported)"
             self.cpu_repack()
             dtype = out_dtype or self.default_out_dtype
-            y = ext.exl3_cpu_linear_forward(
-                self.trellis, self.suh, self.svh, self.K, self.bias,
-                x.view(-1, self.in_features), dtype == torch.float, self.cpu_swz
-            )
+            x2d = x.view(-1, self.in_features)
+            from ...util import cuda_flags as _cf
+            if _cf.cpu_prefill_tier() == "torch" and x2d.shape[0] >= _cf.cpu_prefill_min_m():
+                y = cpu_prefill_torch_forward(self, x2d, dtype)
+            else:
+                y = ext.exl3_cpu_linear_forward(
+                    self.trellis, self.suh, self.svh, self.K, self.bias,
+                    x2d, dtype == torch.float, self.cpu_swz
+                )
             return y.view(x.shape[:-1] + (self.out_features,))
 
         reconstruct = params.get("reconstruct")

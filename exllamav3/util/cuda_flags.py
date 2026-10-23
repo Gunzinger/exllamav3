@@ -63,6 +63,7 @@ CPU_SOURCES = [
     "cpu_compat/cuda_stub.cpp",
     "cpu/moe_mul1.cpp",
     "cpu/linear_mul1.cpp",
+    "cpu/recon_bf16.cpp",
     "cpu/hc_mix_cpu.cpp",
     "cpu/gdn_step_cpu.cpp",
     "cpu/sdpa_paged_cpu.cpp",
@@ -312,3 +313,37 @@ def cuda_cflags(cuda_home: str | None = None, debug: bool = False, hip: bool = F
                 f"--compress-mode (CUDA 12.8 or later is needed)"
             )
     return flags
+
+
+# -------------------------------------------------------------------------------------------
+# CPU prefill tier (Plan 07, Option 1; opt-in until parity is proven):
+#   EXL3_CPU_PREFILL_TIER    off | torch   (default off: the existing mul1 GEMV path runs
+#                                          byte-identically at every M)
+#   EXL3_CPU_PREFILL_MIN_M   row count from which the tier engages (default 32; decode M=1-3
+#                                          never reaches it)
+# At M >= MIN_M the dense CPU linear dequantizes the packed trellis once into a BF16 buffer
+# (ext.exl3_cpu_dequant_bf16) and takes torch.matmul instead of the decode-shape mul1 GEMV.
+# The tier spawns no workers of its own; torch's intra-op pool sizes the matmul (thread/pin
+# knobs: OMP_NUM_THREADS etc. — EXL3_MOE_CPU_THREADS/PIN do not apply to it).
+#   EXL3_CPU_PREFILL_CACHE_BYTES  cap on cached dequantized-BF16 weight buffers per model
+#                                 process (default 2 GiB; 0 disables caching so every tiered
+#                                 forward re-dequantizes).
+# Values are re-read per call so tests and rollback (EXL3_CPU_PREFILL_TIER=off) need no reload.
+# -------------------------------------------------------------------------------------------
+def cpu_prefill_tier() -> str:
+    v = os.environ.get("EXL3_CPU_PREFILL_TIER", "off").strip().lower()
+    return v if v in ("off", "torch") else "off"
+
+
+def cpu_prefill_min_m() -> int:
+    try:
+        return max(1, int(os.environ.get("EXL3_CPU_PREFILL_MIN_M", "32")))
+    except ValueError:
+        return 32
+
+
+def cpu_prefill_cache_bytes() -> int:
+    try:
+        return max(0, int(os.environ.get("EXL3_CPU_PREFILL_CACHE_BYTES", str(2 * 1024**3))))
+    except ValueError:
+        return 2 * 1024**3
