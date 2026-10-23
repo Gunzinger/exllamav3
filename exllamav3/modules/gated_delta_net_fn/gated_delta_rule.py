@@ -247,6 +247,20 @@ def torch_recurrent_kda(q, k, v, g, beta, state):
 # pass on a 5090: better program counts than a long pass, and 1024 already costs +38%)
 _scan_sub_range = int(os.environ.get("EXL3_GDN_SUB_CHUNK", "2048"))
 
+# Prefill chunk scan over all batch rows in one (B, T, H, D) fla pass instead of a per-row python
+# loop. Rows are independent given their initial states, so this is exact whenever no row reads a
+# slot another row of the same pass writes -- always true when rows_in == rows_out (every
+# non-speculative pass; each row then only ever touches its own slot) and when the state pool is
+# None. 0 restores the per-row loop everywhere.
+_scan_batched = os.environ.get("EXL3_GDN_SCAN_BATCHED", "1") != "0"
+
+
+def _slot_index(rows: list[int], device: torch.device) -> torch.Tensor:
+    # Index tensor for a slot row list; the default 0..bsz-1 list avoids the per-call H2D copy
+    if rows == list(range(len(rows))):
+        return buffered_arange(len(rows), device)
+    return torch.tensor(rows, dtype = torch.long, device = device)
+
 
 def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
     """
@@ -266,9 +280,48 @@ def _chunked_scan(fn, q, k, v, g, beta, state, save_state):
         o, state = fn(q[:, t0:t1], k[:, t0:t1], v[:, t0:t1], g = g[:, t0:t1], beta = beta[:, t0:t1],
                       initial_state = state, output_final_state = True, use_qk_l2norm_in_kernel = True)
         if out is None:
-            out = torch.empty((1, T) + o.shape[2:], dtype = o.dtype, device = o.device)
+            out = torch.empty((q.shape[0], T) + o.shape[2:], dtype = o.dtype, device = o.device)
         out[:, t0:t1] = o
     return out, state if save_state else None
+
+
+def _chunked_scan_rows(fn, q, k, v, g, beta, recurrent_state, rows_out, rows_in, history, save_state):
+    """
+    fn (chunk_gated_delta_rule / chunk_kda) over every batch row. q, k: (B, T, H, K); v:
+    (B, T, HV, V); recurrent_state: (S, 1, HV, K, V) pool or None; row i starts from pool row
+    rows_in[i] and its final state is written back to pool row rows_out[i] (save_state). Returns
+    the outputs concatenated on the batch dim, (B, T, HV, V).
+
+    One batched kernel pass when no row can read a slot another row of the same pass writes: holds
+    whenever rows_in == rows_out and not history (each row only touches its own slot), or when
+    recurrent_state is None. The speculative pass (history, rows_in != rows_out) keeps the original
+    sequential per-row loop; EXL3_GDN_SCAN_BATCHED=0 forces it everywhere.
+    """
+    if not _scan_batched or (recurrent_state is not None and (history or rows_in != rows_out)):
+        core_attn_out = []
+        for i, (so, si) in enumerate(zip(rows_out, rows_in)):
+            # .float(): the chunk kernels take and return fp32; an fp16 pool is converted on the way in and
+            # by the copy_ on the way out
+            state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
+            core_attn, new_state = _chunked_scan(
+                fn, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
+                state, save_state,
+            )
+            if save_state and state is not None:
+                recurrent_state[so, 0].copy_(new_state.squeeze(0))
+            core_attn_out.append(core_attn)
+        return torch.cat(core_attn_out, dim = 0)
+
+    state = None
+    if recurrent_state is not None:
+        # Advanced indexing copies, so the scan never aliases the pool; .float() is a no-op on an
+        # fp32 pool and the write-back casts back to the pool dtype
+        state = recurrent_state[_slot_index(rows_in, recurrent_state.device), 0].float()
+    core_attn, new_state = _chunked_scan(fn, q, k, v, g, beta, state, save_state)
+    if save_state and state is not None:
+        # index put does not cast: write back in the pool dtype (fp32 pool: no-op cast)
+        recurrent_state[_slot_index(rows_out, recurrent_state.device), 0] = new_state.to(recurrent_state.dtype)
+    return core_attn
 
 
 def gated_delta_rule_fn(
@@ -338,19 +391,11 @@ def gated_delta_rule_fn(
             v = v.view(bsz, seqlen, -1, v_head_dim)
 
             rows_out, rows_in = chunked_rows()
-            core_attn_out = []
-            for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-                # .float(): the chunk kernels take and return fp32; an fp16 pool is converted on the way in and
-                # by the copy_ on the way out
-                state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
-                core_attn, new_state = _chunked_scan(
-                    chunk_kda, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
-                    state, save_state,
-                )
-                if save_state and state is not None:
-                    recurrent_state[so, 0].copy_(new_state.squeeze(0))
-                core_attn_out.append(core_attn)
-            return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
+            core_attn_out = _chunked_scan_rows(
+                chunk_kda, q, k, v, g, beta,
+                recurrent_state, rows_out, rows_in, history, save_state,
+            )
+            return core_attn_out.to(torch.bfloat16)
 
         core_attn_out = torch.empty(
             (bsz, seqlen, num_v_heads, v_head_dim),
@@ -390,18 +435,11 @@ def gated_delta_rule_fn(
 
         # (Grouped attn supported in fla-core now)
         rows_out, rows_in = chunked_rows()
-        core_attn_out = []
-        for i, (so, si) in enumerate(zip(rows_out, rows_in)):
-            state = recurrent_state[si, 0].float().unsqueeze(0) if recurrent_state is not None else None
-            core_attn, new_state = _chunked_scan(
-                chunk_gated_delta_rule, q[i:i + 1], k[i:i + 1], v[i:i + 1], g[i:i + 1], beta[i:i + 1],
-                state, save_state,
-            )
-            if save_state and state is not None:
-                recurrent_state[so, 0].copy_(new_state.squeeze(0))
-            core_attn_out.append(core_attn)
-
-        core_attn_out = torch.cat(core_attn_out, dim = 0)
+        core_attn_out = _chunked_scan_rows(
+            chunk_gated_delta_rule, q, k, v, g, beta,
+            recurrent_state, rows_out, rows_in, history, save_state,
+        )
+        return core_attn_out
 
     # Fused recurrent rule
     else:
