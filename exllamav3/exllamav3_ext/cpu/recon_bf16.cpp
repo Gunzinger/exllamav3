@@ -1,8 +1,8 @@
 // Dequantize-to-BF16 for one mul1 EXL3 dense matrix (Plan 07 Option 1: CPU prefill tier). See
 // recon_bf16.h for the contract. The format tables below are exact copies of moe_mul1.cpp's
-// (pure integer math — a duplicate cannot diverge), and the transform order mirrors the fused
-// kernel: weights carry suh before the k-side Hadamard and svh before the n-side pass, with one
-// HAD_SCALE per pass, so the fp32 dequant equals the kernel's implied weight matrix up to the
+// (pure integer math — a duplicate cannot diverge), and the produced weight equals the
+// kernel-equivalent matrix W = (H @ what @ H) * (suh ⊗ svh) / 128 (both Hadamards first, the
+// diagonal scales strictly after — oracle cpu-trial/tests/test_linear_cpu.py) up to the
 // activation-side int8 quantization the fused path performs and this path does not.
 #if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include "recon_bf16.h"
@@ -122,15 +122,13 @@ void dequant_impl(const MoeCpuMatrix& mat, float* w, int g)
                 float* out_row = base + static_cast<size_t>(row) * mat.k;
                 for (int col = 0; col < 16; ++col)
                 {
-                    const int t = g_tc_inv[row * 16 + col];
-                    out_row[col] = decode_mul1_scalar(decode_state_scalar<bits, hb>(tile, t))
-                                   * half_to_float(mat.suh[kt * 16 + col]);
+                    const int t = g_tc_inv[col * 16 + row];   // slot is k-major: weight (n_off, k_off) -> slot g_tc_inv[k_off*16 + n_off]
+                    out_row[col] = decode_mul1_scalar(decode_state_scalar<bits, hb>(tile, t));
                 }
             }
         }
 
-    // k-side Hadamard per 128-block, scale once (mirrors the input-side x transform: values
-    // carry suh before the butterfly, HAD_SCALE after)
+    // k-side Hadamard per 128-block, scale once
     for (int k0 = 0; k0 < mat.k; k0 += 128)
         for (int n = 0; n < mat.n; ++n)
         {
@@ -139,13 +137,10 @@ void dequant_impl(const MoeCpuMatrix& mat, float* w, int g)
             for (int i = 0; i < 128; ++i) v[i] *= R_HAD_SCALE;
         }
 
-    // svh into every row before the n-side pass
-    for (int n = 0; n < mat.n; ++n)
-    {
-        const float sv = half_to_float(mat.svh[n]);
-        float* row = w + static_cast<size_t>(n) * mat.k;
-        for (int k = 0; k < mat.k; ++k) row[k] *= sv;
-    }
+    // Diagonal scales strictly AFTER both butterflies: the kernel-equivalent weight is
+    // W = (H @ what @ H) * (suh ⊗ svh) / 128 (oracle: cpu-trial/tests/test_linear_cpu.py —
+    // gates the real mul1 kernels; a diagonal does not commute with the Hadamard, so folding
+    // suh/svh in before the butterflies is a structural error, not a rounding one)
 
     // n-side Hadamard per 128-block (output-side transform), scale once
     for (int n0 = 0; n0 < mat.n; n0 += 128)
@@ -155,6 +150,15 @@ void dequant_impl(const MoeCpuMatrix& mat, float* w, int g)
             hadamard_128_stride(v, mat.k);
             for (int i = 0; i < 128; ++i) v[static_cast<size_t>(i) * mat.k] *= R_HAD_SCALE;
         }
+
+    // suh (per in-column) and svh (per out-row) applied after both passes, one sweep
+    for (int n = 0; n < mat.n; ++n)
+    {
+        const float sv = half_to_float(mat.svh[n]);
+        float* row = w + static_cast<size_t>(n) * mat.k;
+        for (int k = 0; k < mat.k; ++k)
+            row[k] *= sv * half_to_float(mat.suh[k]);
+    }
 }
 
 }  // namespace

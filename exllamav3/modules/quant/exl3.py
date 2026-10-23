@@ -135,9 +135,10 @@ def cpu_linear_forward_batch(linears, x, params, out_dtypes = None):
     # The prefill tier changes per-linear semantics at M >= min, so the batched decode path
     # defers to the per-linear forwards (which tier individually) whenever it would engage
     from ...util import cuda_flags as _cf
+    _l0_inner = getattr(linears[0], "inner", linears[0])   # entries may be bare LinearEXL3
     _tier_active = (_cf.cpu_prefill_tier() == "torch"
                     and x.numel() // k >= _cf.cpu_prefill_min_m()
-                    and cpu_prefill_supported(linears[0].inner))
+                    and cpu_prefill_supported(_l0_inner))
     eligible = x.is_contiguous() and not _tier_active
     if eligible:
         for i, l in enumerate(linears):

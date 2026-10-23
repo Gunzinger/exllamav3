@@ -57,9 +57,10 @@ def had128() -> torch.Tensor:
     return H
 
 
-def dequant_weight_fp32(trellis, suh, svh, grp = 0) -> torch.Tensor:
-    """Reference W [in, out] fp32 (mul1 codebook, any K incl. +0.5) — independent oracle.
-    grp: band-8 packed trellis is undone to native tile order first."""
+def dequant_weight_fp32(trellis, suh, svh, grp = 0, dtype = torch.float32) -> torch.Tensor:
+    """Reference W [in, out] (mul1 codebook, any K incl. +0.5) — independent oracle.
+    grp: band-8 packed trellis is undone to native tile order first. dtype: fp64 isolates the
+    integer-exact decode (states -> codebook) from fp32 butterfly accumulation order."""
     if grp:
         kt, nt, words = trellis.shape
         native = torch.empty_like(trellis)
@@ -81,11 +82,12 @@ def dequant_weight_fp32(trellis, suh, svh, grp = 0) -> torch.Tensor:
     prod = (states * MUL1_MULT) & 0xFFFFFFFF
     bsum = (prod & 255) + ((prod >> 8) & 255) + ((prod >> 16) & 255) + (prod >> 24)
     val = (bsum.float() - 510.0) * K_INV
+    val = val.to(dtype)
     what = val[:, :, tc_perm_inv()].reshape(kt, nt, 16, 16).permute(0, 2, 1, 3).reshape(kt * 16, nt * 16)
     k, n = what.shape
-    H = had128()
-    W = torch.empty(k, n)
-    suhf, svhf = suh.float(), svh.float()
+    H = had128().to(dtype)
+    W = torch.empty(k, n, dtype = dtype)
+    suhf, svhf = suh.to(dtype), svh.to(dtype)
     for kb in range(0, k, 128):
         for nb in range(0, n, 128):
             W[kb:kb + 128, nb:nb + 128] = (H @ what[kb:kb + 128, nb:nb + 128] @ H) \
@@ -149,8 +151,19 @@ def test_dequant_parity():
             err = (w.float() - ref).abs()
             ratio = (err / bf16_ulp(ref)).max().item()
             worst = max(worst, ratio)
-            print(f"    K={K:<4} swz={int(swz)}  max-abs {err.max().item():.3e}  max dist {ratio:.3f} bf16-ulp")
-            assert ratio <= 1.05, f"K={K} swz={swz}: {ratio:.2f} bf16 ulp (> 1-ulp class)"
+            # 1-ulp-class gate with an explicit fp32 cross-order noise floor: the C++ and the
+            # torch oracle accumulate the 128-point Hadamards in different orders, so elements
+            # where the oracle cancels to (near-)zero can differ by ~1e-8 absolute while being
+            # meaningless in relative terms (measured: 2/131072 elements at K=1, all |ref|<=3e-8,
+            # err <= 4e-9). Every element with |ref| > 1e-6 must be strictly within 1 ulp; the
+            # absolute floor may be used by at most 0.1 % of elements.
+            strict = err <= 1.05 * bf16_ulp(ref)
+            floor = err <= 1e-7
+            n_floor = int((~strict).sum())
+            print(f"    K={K:<4} swz={int(swz)}  max-abs {err.max().item():.3e}  max dist {ratio:.3f} bf16-ulp"
+                  f"  ({n_floor} elems on noise floor)")
+            assert (strict | floor).all(), f"K={K} swz={swz}: element exceeds 1-ulp class AND the 1e-7 floor"
+            assert n_floor <= max(1, err.numel() // 1000), f"K={K} swz={swz}: {n_floor} elements need the floor (>0.1%)"
     print(f"    worst: {worst:.3f} bf16-ulp  (<= 1-ulp class incl. fp32 accumulation-order noise)")
 
 
@@ -212,7 +225,7 @@ def test_tier_dispatch():
 # --------------------------------------------------------------------------- (c)
 
 def test_old_vs_new():
-    print("(c) old (mul1 GEMV, int8-x quant) vs new (bf16 dequant + matmul) at M=64/128")
+    print("(c) old (mul1 GEMV, int8-x quant) and new (bf16 dequant + matmul) vs fp64 truth, M=64/128")
     for m in (64, 128):
         trellis, suh, svh, Kf, swz = make_linear(K = 4, seed = 100 + m)
         lin = LinearEXL3(None, 256, 512, suh = suh, svh = svh, trellis = trellis,
@@ -225,14 +238,26 @@ def test_old_vs_new():
             x = (0.5 + 0.1 * torch.randn(m, 256, generator = G)).half()
             y_old = ext.exl3_cpu_linear_forward(lin.trellis, suh, svh, Kf, None, x, True, lin.cpu_swz)
             y_new = cpu_prefill_torch_forward(lin, x, torch.float)
+            # fp64 ground truth: integer-exact decode + fp64 butterflies; both paths quantize
+            # the SAME half-precision activations, so the reference isolates weight/quant class
+            w64 = dequant_weight_fp32(trellis, suh, svh, grp = 8 if swz else 0, dtype = torch.float64)
+            y_ref = (x.double() @ w64).float()
+            scale = y_ref.abs().max().item()
+            rel_old = (y_old - y_ref).abs().max().item() / scale
+            rel_new = (y_new - y_ref).abs().max().item() / scale
             err = (y_new - y_old).abs()
-            scale = y_old.abs().max().item()
-            rel = err.max().item() / scale
-            rms = (err.pow(2).mean().sqrt() / y_old.pow(2).mean().sqrt()).item()
+            rms = (err.pow(2).mean().sqrt() / y_ref.pow(2).mean().sqrt()).item()
             flips = (y_old.argmax(-1) != y_new.argmax(-1)).sum().item()
-            print(f"    M={m:<4} max-abs {err.max().item():.5f}  rel-absmax {rel:.5f}  "
-                  f"rms-ratio {rms:.5f}  argmax flips {flips}/{m}")
-            assert rel < 5e-3, f"M={m}: rel {rel:.5f} exceeds the 5e-3 fp16-class bound"
+            print(f"    M={m:<4} rel_old {rel_old:.5f} (int8 class)  rel_new {rel_new:.5f} (bf16 class)"
+                  f"  rms-ratio {rms:.5f}  argmax flips {flips}/{m}")
+            # classes: old = int8 activation quant (step ~ group-max/127, errors can accumulate
+            # coherently -> measured ~1.8e-2 worst-case here; sanity bound 2.5e-2 guards the
+            # oracle, not the kernel); new = bf16 weights AND activations (2^-8) with fp32
+            # accumulation -> gated at 1e-2, and never farther from the truth than the old path
+            assert rel_old <= 2.5e-2, f"M={m}: old path {rel_old:.5f} out of int8 class (oracle broken?)"
+            assert rel_new <= 1e-2, f"M={m}: new path {rel_new:.5f} exceeds bf16 class"
+            assert rel_new <= rel_old + 2e-3, f"M={m}: new path farther from truth than old"
+            assert flips <= max(1, m // 64), f"M={m}: {flips} argmax flips (not argmax-stable class)"
         finally:
             os.environ.pop("EXL3_CPU_PREFILL_TIER", None)
 
