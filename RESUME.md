@@ -1,5 +1,9 @@
 # RESUME — opt05: GLM-5.3 DSA prefill (lazy k-pool planes + batched up-projection)
 
+**COMPLETE 2026-10-24 — verification gates run: parity PASS everywhere, acceptance
+FAIL (serving delta ≈ 0 %) → NO-GO for merge. Full results, per-part attribution
+and verdict: `PLAN-opt-glm-dsa.md`. Raw artifacts: `tests/results/`.**
+
 Branch `opt/glm-dsa-prefill` (worktree `opt-glm-dsa/`, off `cpu-only` @ bc731a5e).
 Commits: `4aa9c428` (code), `2e008d7e` (harness + default-on). Written under a ~30-min
 host deadline: parity gate + benches DEFERRED (see §5), everything else landed.

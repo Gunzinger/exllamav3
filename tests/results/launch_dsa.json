@@ -1,0 +1,365 @@
+{
+ "prompt_tokens": 2048,
+ "summary": {
+  "lazy_vs_base": {
+   "triton": -11,
+   "pool_updates": "22 -> 11",
+   "mm_calls": "44 -> 44",
+   "wall_s": "24.954 -> 24.897 (-0.2 %)"
+  },
+  "upproj_vs_lazy": {
+   "mm_calls": "44 -> 22",
+   "wall_s": "24.897 -> 23.859 (-4.2 %)"
+  }
+ },
+ "detail": {
+  "base": {
+   "lazy": false,
+   "batch_upproj": false,
+   "wall_s": 24.9537,
+   "prefill_spans": [
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ]
+   ],
+   "triton_launches": 756,
+   "triton_names": {
+    "_causal_conv1d_update_slotted_output_kernel": 34,
+    "_causal_conv1d_update_slotted_state_kernel": 34,
+    "l2norm_fwd_kernel": 136,
+    "chunk_local_cumsum_vector_kernel": 68,
+    "chunk_kda_fwd_kernel_intra_token_parallel": 68,
+    "chunk_kda_fwd_kernel_inter_solve_fused": 68,
+    "recompute_w_u_fwd_kda_kernel": 68,
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": 68,
+    "chunk_gla_fwd_kernel_o": 68,
+    "_mla_kv_update_kernel": 22,
+    "_mla_plane_update_kernel": 44,
+    "_mla_gather_tile_kernel": 22,
+    "_mla_prefill_mha_kernel": 22,
+    "_causal_conv1d_update_slotted_kernel": 34
+   },
+   "torch_mm_calls": 44,
+   "torch_mm_us_total": 0.0,
+   "pool_plane_updates": 22,
+   "pool_plane_us_total": 0.0
+  },
+  "lazy": {
+   "lazy": true,
+   "batch_upproj": false,
+   "wall_s": 24.8969,
+   "prefill_spans": [
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ]
+   ],
+   "triton_launches": 745,
+   "triton_names": {
+    "_causal_conv1d_update_slotted_output_kernel": 34,
+    "_causal_conv1d_update_slotted_state_kernel": 34,
+    "l2norm_fwd_kernel": 136,
+    "chunk_local_cumsum_vector_kernel": 68,
+    "chunk_kda_fwd_kernel_intra_token_parallel": 68,
+    "chunk_kda_fwd_kernel_inter_solve_fused": 68,
+    "recompute_w_u_fwd_kda_kernel": 68,
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": 68,
+    "chunk_gla_fwd_kernel_o": 68,
+    "_mla_kv_update_kernel": 22,
+    "_mla_plane_update_kernel": 33,
+    "_mla_gather_tile_kernel": 22,
+    "_mla_prefill_mha_kernel": 22,
+    "_causal_conv1d_update_slotted_kernel": 34
+   },
+   "torch_mm_calls": 44,
+   "torch_mm_us_total": 0.0,
+   "pool_plane_updates": 11,
+   "pool_plane_us_total": 0.0
+  },
+  "upproj": {
+   "lazy": true,
+   "batch_upproj": true,
+   "wall_s": 23.8589,
+   "prefill_spans": [
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     0,
+     1792
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ],
+    [
+     1792,
+     2047
+    ]
+   ],
+   "triton_launches": 745,
+   "triton_names": {
+    "_causal_conv1d_update_slotted_output_kernel": 34,
+    "_causal_conv1d_update_slotted_state_kernel": 34,
+    "l2norm_fwd_kernel": 136,
+    "chunk_local_cumsum_vector_kernel": 68,
+    "chunk_kda_fwd_kernel_intra_token_parallel": 68,
+    "chunk_kda_fwd_kernel_inter_solve_fused": 68,
+    "recompute_w_u_fwd_kda_kernel": 68,
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64": 68,
+    "chunk_gla_fwd_kernel_o": 68,
+    "_mla_kv_update_kernel": 22,
+    "_mla_plane_update_kernel": 33,
+    "_mla_gather_tile_kernel": 22,
+    "_mla_prefill_mha_kernel": 22,
+    "_causal_conv1d_update_slotted_kernel": 34
+   },
+   "torch_mm_calls": 22,
+   "torch_mm_us_total": 0.0,
+   "pool_plane_updates": 11,
+   "pool_plane_us_total": 0.0
+  }
+ }
+}
