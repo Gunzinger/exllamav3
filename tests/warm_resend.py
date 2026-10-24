@@ -90,10 +90,10 @@ def post(base_url, content, max_tokens, timeout):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:8081")
-    ap.add_argument("--full-words", type=int, default=26000,
-                    help="approx word count of the base prompt (~30k tokens)")
-    ap.add_argument("--suffix-words", type=int, default=1800,
-                    help="approx word count of the resend suffix (~2k tokens)")
+    ap.add_argument("--full-tokens", type=int, default=30000,
+                    help="approx TOKEN count of the base prompt (calibrated, see below)")
+    ap.add_argument("--suffix-tokens", type=int, default=1900,
+                    help="approx TOKEN count of the resend suffix")
     ap.add_argument("--seed", type=int, default=4711)
     ap.add_argument("--label", default="")
     ap.add_argument("--knob", default="")
@@ -101,10 +101,23 @@ def main():
     ap.add_argument("--timeout", type=int, default=3600)
     a = ap.parse_args()
 
-    print(f"[warm_resend] building prompts ({a.full_words}+{a.suffix_words} words)…",
-          file=sys.stderr, flush=True)
-    p_full = gen_text(a.full_words, a.seed)
-    p_suffix = p_full + " " + gen_text(a.suffix_words, a.seed + 1)
+    # Calibrate the words->tokens ratio of our prose against THIS server's tokenizer
+    # with a 200-word probe (naive ratios are badly off for natural text: measured
+    # 2.2 tokens/word on qwen — a word-based guess produced a 56.7k-token prompt and
+    # a CTX 400). Probe + template overhead ~25 tokens.
+    probe = post(a.base_url, gen_text(200, a.seed + 2), 1, 120)
+    pt = probe.get("prompt_tokens") or 0
+    if pt <= 50:
+        print(f"[warm_resend] probe failed ({probe})", file=sys.stderr, flush=True)
+        sys.exit(1)
+    ratio = (pt - 25) / 200
+    full_words = max(200, int(a.full_tokens / ratio))
+    suffix_words = max(50, int(a.suffix_tokens / ratio))
+    print(f"[warm_resend] probe: {pt} tokens / 200 words -> {ratio:.2f} tok/word; "
+          f"targets {full_words}+{suffix_words} words", file=sys.stderr, flush=True)
+
+    p_full = gen_text(full_words, a.seed)
+    p_suffix = p_full + " " + gen_text(suffix_words, a.seed + 1)
 
     print("[warm_resend] 1) full prefill (cold)", flush=True)
     r1 = post(a.base_url, p_full, 1, a.timeout)

@@ -33,13 +33,16 @@ mkdir -p "$EVID"
 
 log() { echo "[orch:${TAG}] $(date +%H:%M:%S) $*"; }
 
-run_arm() {
+run_arm() (
     local name="$1" mib="$2"
+    # always stop the server when the arm body exits (success OR failure) — a dead
+    # orchestrator must never leave a GPU server holding the serialisation lock
+    trap 'bash "$LL/scripts/60_serve.sh" stop >/dev/null 2>&1 || true; rm -f "$LL/serve.pid"' EXIT
     log "=== arm $name (EXL3_RECON_CACHE_MIB=$mib) ==="
 
     # start server against the worktree
     PYTHONPATH="$WT" EXL3_RECON_CACHE_MIB="$mib" \
-        MODEL="$MODEL" ${MODEL_REV:+MODEL_REV="$MODEL_REV"} \
+        MODEL="$MODEL" MODEL_REV="${MODEL_REV:?MODEL_REV required}" \
         CTX="$CTX" KV="$KV" PORT="$PORT" bash "$LL/scripts/60_serve.sh" start
     local pid; pid=$(cat "$LL/serve.pid")
     sleep 2
@@ -53,8 +56,11 @@ run_arm() {
     fi
     log "server pid $pid — worktree import verified (evidence $EVID/${TAG}-${name}-environ.txt)"
 
-    # warm-discard (JIT/handle/clock warmup; row marked discard, never compared)
-    MODE=prefill PROMPT_TOKENS=2048 REPS=1 \
+    # warm-discard (JIT/handle/clock warmup; row marked discard, never compared).
+    # 512 on purpose: bench_serve derives prompts as gen_prompt(size, seed+size), so a
+    # 2048-sized discard would poison the measured 2048 request with a full prompt-cache
+    # hit (measured exactly that way before the fix: cached=2304/2402, 1910 tok/s bogus).
+    MODE=prefill PROMPT_TOKENS=512 REPS=1 \
         LABEL="reconcache-${name}-discard" bash "$LL/scripts/65_bench.sh"
 
     # 3 measured reps of the full sweep
@@ -77,7 +83,7 @@ run_arm() {
     bash "$LL/scripts/60_serve.sh" stop
     sleep 5
     log "=== arm $name complete ==="
-}
+)
 
 for arm in $ARMS; do
     name="${arm%%:*}"; mib="${arm##*:}"
