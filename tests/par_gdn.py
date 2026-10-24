@@ -168,9 +168,11 @@ def main():
             toks = _run_job(gen, tokenizer, ids, 1)
 
             layers = {}
-            for idx, l in cache.get_all_recurrent_layers().items():
+            for n, (instance, l) in enumerate(
+                    cache.get_all_recurrent_layers().items()):
                 dtype, rows = _STATE_SNAP[id(l.recurrent_state)]
-                layers[int(idx)] = {
+                layers[n] = {
+                    "instance": str(instance),
                     "pool_dtype": str(dtype).replace("torch.", ""),
                     "recurrent": rows,
                     "conv": l.conv_state[:1, :, :l.module.conv_kernel_size]
