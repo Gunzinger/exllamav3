@@ -22,20 +22,29 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
-def _tile_ids(qbench_path, target_len, bsz):
+def _job_ids(qbench_path, target_len, bsz, salt=0):
+    """(bsz, target_len) ids; each batch row built from a DIFFERENT qbench row so
+    no job (or pass — warmup vs measured use different salts) shares a prompt
+    with another: the Generator's in-process prompt cache would otherwise serve
+    repeats and mask the prefill (plan-04 lesson)."""
+    import torch
     with open(qbench_path) as f:
-        base = list(json.load(f)["rows"][0]["input_ids"])
-    ids = base[:]
-    while len(ids) < target_len:
-        ids.extend(base[1:])
-    ids = torch.tensor([ids[:target_len]], dtype=torch.long)
-    return ids.repeat(bsz, 1)
+        rows = [r["input_ids"] for r in json.load(f)["rows"]]
+    out = []
+    for b in range(bsz):
+        base = rows[(salt + b) % len(rows)]
+        ids = base[:]
+        while len(ids) < target_len:
+            ids.extend(base[1:])
+        out.append(ids[:target_len])
+    return torch.tensor(out, dtype=torch.long)
 
 
 def _run_jobs(gen, tokenizer, ids, max_new=1):
@@ -61,19 +70,40 @@ def _run_jobs(gen, tokenizer, ids, max_new=1):
     return n
 
 
+def _install_triton_counter(counter):
+    """Count triton kernel launches by name. Needed because this kineto build
+    does not trace triton's launch API (hipLaunchKernel*ExC path): torch-op and
+    extension kernels appear as cat=="kernel" events, triton ones do not."""
+    from triton.runtime.jit import JITFunction
+
+    orig = JITFunction.run
+
+    def wrapped(self, *args, **kwargs):
+        counter[self.fn.__name__] += 1
+        return orig(self, *args, **kwargs)
+
+    JITFunction.run = wrapped
+    return orig
+
+
 def count_kernels(prof, trace_path):
     import tempfile
+    from collections import Counter
     fd, path = tempfile.mkstemp(suffix=".json", dir=os.path.dirname(trace_path))
     os.close(fd)
     prof.export_chrome_trace(path)
     with open(path) as f:
         trace = json.load(f)
     os.unlink(path)
+    cats = Counter(e.get("cat") for e in trace.get("traceEvents", []))
     kernels = {}
     for e in trace.get("traceEvents", []):
-        if e.get("cat") in ("kernel", "gpu_kernel"):
+        if e.get("cat") in ("kernel", "gpu_kernel", "Kernel"):
             name = e["name"]
             kernels[name] = kernels.get(name, 0) + 1
+    if not kernels:
+        print(f"[warn] no kernel events in trace; categories: {dict(cats)}",
+              flush=True)
     return kernels
 
 
@@ -86,8 +116,12 @@ def main():
         os.path.dirname(ROOT), "models", "qwen3.8-flash-next-exl3",
         "qbench_prompts.json"))
     p.add_argument("--arm", choices=["old", "new"], default=None,
-                   help="run ONE pass only (this arm, this bsz) — for external "
-                        "profilers (rocprofv3); no in-process A/B, no summary")
+                   help="run ONE pass only (this arm) — for external profilers "
+                        "(rocprofv3 wraps the whole process); no in-process A/B")
+    p.add_argument("--bsz", type=int, default=4, help="batch size in --arm mode")
+    p.add_argument("--skip-pass", action="store_true",
+                   help="baseline: load only, no jobs (subtract from arm runs "
+                        "to get pass-only launch counts)")
     p.add_argument("--out", default="/tmp/opencode/launch_gdn.json")
     args = p.parse_args()
 
@@ -97,12 +131,17 @@ def main():
 
     if args.ctx is None:
         # concurrent jobs each need room for their own prompt + generation span
-        args.ctx = 4 * (args.prompt_tokens + 16) if args.prompt_tokens >= 1024 \
-            else args.prompt_tokens + 64
+        need = 4 * (args.prompt_tokens + 16)
+        args.ctx = (need + 255) // 256 * 256  # page-size multiple of 256
 
     config = Config.from_directory(args.model_dir)
     tokenizer = Tokenizer.from_config(config)
     model = Model.from_config(config)
+    # ONE cache + generator, created BEFORE model.load (exllamav3 rule); per-job
+    # states start cleared (fresh GDNState at position 0), so every pass is
+    # well-defined. 4 slots cover the bsz=4 passes; bsz=1 uses one slot.
+    cache = Cache(model, max_num_tokens=args.ctx, max_batch_size=4, max_history=0)
+    gen = Generator(model, cache, tokenizer)
     model.load(torch.device("cuda:0"))
     print("[load] done", flush=True)
 
@@ -120,24 +159,38 @@ def main():
 
     gdr._chunked_scan_rows = wrapped
 
+    triton_counter = Counter()
+    _install_triton_counter(triton_counter)
+
     results = {}
-    bszs = (4,) if args.arm else (1, 4)
+    pass_index = 0
+    if args.skip_pass:
+        # baseline for external-profiler runs: model load, no jobs
+        print("[baseline] load only, no passes", flush=True)
+        model.unload()
+        return
+    bszs = (args.bsz,) if args.arm else (1, 4)
     arms = ((args.arm, args.arm == "new"),) if args.arm else \
         (("old", False), ("new", True))
     for bsz in bszs:
         for arm, batched in arms:
-            cache = Cache(model, max_num_tokens=args.ctx, max_batch_size=bsz,
-                          max_history=0)
-            gen = Generator(model, cache, tokenizer)
-            ids = _tile_ids(args.qbench, args.prompt_tokens, bsz)
+            # distinct prompts for warmup (salt 100+) and measured pass (salt
+            # pass_index), and across batch rows — bust the prompt cache
             gdr._scan_batched = batched
 
             # warmup at the same shape: triton autotune must not pollute counts
             scan_calls.clear()
-            _run_jobs(gen, tokenizer, ids)
+            triton_counter.clear()
+            _run_jobs(gen, tokenizer, _job_ids(args.qbench, args.prompt_tokens,
+                                               bsz, salt=100 + pass_index))
             torch.cuda.synchronize()
+            tri_warm = sum(triton_counter.values())
 
             scan_calls.clear()
+            triton_counter.clear()
+            ids = _job_ids(args.qbench, args.prompt_tokens, bsz,
+                           salt=pass_index)
+            pass_index += 1
             if args.arm:
                 # external-profiler mode: count offline from the profiler's own
                 # trace; here just run the pass (autotune warmup already done)
@@ -146,25 +199,29 @@ def main():
                 print(f"[single] bsz={bsz} arm={arm} done "
                       f"(scan_calls={len(scan_calls)} shapes={sorted(set(scan_calls))})",
                       flush=True)
-                del gen, cache
                 continue
             with profile(activities=[ProfilerActivity.CUDA]) as prof:
                 _run_jobs(gen, tokenizer, ids)
                 torch.cuda.synchronize()
             kernels = count_kernels(prof, args.out)
             calls = list(scan_calls)
-            total = sum(kernels.values())
+            tri = dict(triton_counter)
+            total = sum(kernels.values()) + sum(tri.values())
             results[f"bsz{bsz}_{arm}"] = {
                 "batched": batched,
                 "total_kernels": total,
+                "torch_kernels": sum(kernels.values()),
+                "triton_launches": sum(tri.values()),
+                "triton_names": tri,
+                "triton_warmup": tri_warm,
                 "scan_calls": len(calls),
                 "scan_shapes": sorted(set(calls)),
                 "kernels": kernels,
             }
             print(f"[count] bsz={bsz} arm={arm}: total={total} "
-                  f"scan_calls={len(calls)} shapes={sorted(set(calls))}",
-                  flush=True)
-            del gen, cache
+                  f"(torch={sum(kernels.values())} triton={sum(tri.values())} "
+                  f"warmup_tri={tri_warm}) scan_calls={len(calls)} "
+                  f"shapes={sorted(set(calls))}", flush=True)
 
     gdr._chunked_scan_rows = orig
     gdr._scan_batched = True
