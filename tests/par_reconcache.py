@@ -102,9 +102,16 @@ def run_pass(model, tokenizer, prompts, max_new, ctx, label):
     # 34.7 s — no prefill happened at all). The recon shadows live in the GLOBAL
     # recon_cache LRU, not in the Generator, so recreating Cache/Generator yields a
     # genuine cold-prefill pass 2 and a warm-shadow pass 3 without changing what the
-    # gate compares. (Cache tensors are allocated post-load via cache.alloc().)
+    # gate compares. The model loader allocates cache tensors in load_local(); we
+    # replicate that here (attn cache layers + recurrent layer states) and free at
+    # pass end, since a Cache attached after load() is never auto-allocated.
     cache = Cache(model, max_num_tokens=ctx, max_batch_size=1, max_history=0)
-    cache.alloc(torch.device("cuda:0"))
+    dev = torch.device("cuda:0")
+    for cl in cache.layers.values():
+        cl.alloc(dev)
+    for rl in cache.recurrent_layers.values():
+        rl.alloc(dev)
+    cache.initialized = True
     gen = Generator(model, cache, tokenizer)
 
     prompt_budget = ctx - max_new - 16
@@ -132,7 +139,11 @@ def run_pass(model, tokenizer, prompts, max_new, ctx, label):
         print(f"  [{label}] row{i}: in={int(ids.numel())} out={len(toks)} "
               f"head={toks[:6]} ({time.perf_counter() - t0:.1f}s)", flush=True)
     del gen
-    cache.free()
+    for cl in cache.layers.values():
+        cl.free()
+    for rl in cache.recurrent_layers.values():
+        rl.free()
+    cache.initialized = False
     del cache
     return out
 
