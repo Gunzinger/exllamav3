@@ -150,7 +150,8 @@ def run_generation(model_dir, mode, rows, max_new, ctx, qbench_path):
                               encode_special_tokens=True),
              tokenizer.encode(_long_text(250, 912), add_bos=True,
                               encode_special_tokens=True)]
-    prompts = [torch.tensor([e], dtype=torch.long) for e in extra] + prompts
+    prompts = [e if torch.is_tensor(e) else torch.tensor([e], dtype=torch.long)
+               for e in extra] + prompts
 
     stats_off = set_knob(None)
     print(f"[knob] off  stats={stats_off}", flush=True)
