@@ -1,7 +1,10 @@
 # opt02 — Remove the per-MoE-layer `expert_count.tolist()` drain (branch `opt/tolist-counts`)
 
-Status: **partial land, unit-verified, E2E UNVERIFIED** (host window forbade models/benches).
-Commits: `369903e3` (code), `30608781` (tests), + docs.
+Status: **VERIFIED 2026-10-24 — parity PASS, perf acceptance FAIL, do not merge.** The
+staged sync still costs 1–3 ms/chunk (0.03–0.14 % of prefill) and gains 0 % end-to-end;
+Path B (device-side scan) is a measured NO-GO. Full tables + anomalies:
+`PLAN-opt-tolist.md` (same directory). Branch head: `44ed3e5f`.
+Commits: `369903e3` (code), `30608781` (tests), `6ddfad72`/`44ed3e5f` (drivers), docs.
 
 ## What landed (all gated by `EXL3_MOE_DEVICE_COUNT`, default ON, `0` = old path)
 
