@@ -1,125 +1,62 @@
 # RESUME — opt/multirow-tiles (plan 03: multi-row GEMM tiles for the ROCm/RDNA kernel map)
 
+**STATUS: COMPLETE — GO (see `/home/daniel/development/gunzi/local-llm/PLAN-opt-multirow.md`
+for the full report).** Branch `opt/multirow-tiles`, all work committed. No server left running;
+main tree untouched.
+
 Worktree: `/home/daniel/development/gunzi/local-llm/opt-multirow` (branch `opt/multirow-tiles`,
 forked from `cpu-only` @ bc731a5e). Plan authority:
-`/home/daniel/development/amd_zen_sogs/inference-analysis/plans/03-rdna-multirow-tiles.md`
-(= the dispatch's "03-rdma…", filename differs). Report goes to
-`/home/daniel/development/gunzi/local-llm/PLAN-opt-multirow.md` (local-llm ROOT).
+`/home/daniel/development/amd_zen_sogs/inference-analysis/plans/03-rdna-multirow-tiles.md`.
 
-## Environment (every shell)
+## Audit findings (task 1) — final
 
-```bash
-source /home/daniel/development/gunzi/local-llm/env-rocm10.sh
-cd /home/daniel/development/gunzi/local-llm/opt-multirow
-export MAX_JOBS=16 TORCH_EXTENSIONS_DIR=$PWD/.torch_ext PYTHONPATH=$PWD
-PY=/home/daniel/development/gunzi/local-llm/.venv/bin/python
-```
+- (a) **Native WMMA is active on gfx1150** — device probe with the build's exact flags:
+  `__GFX11__` defined, `EXL3_WMMA_EMULATED` gate false (`rocm/rdna_wmma_emu.cuh:8`). No pivot.
+- (b) LDS table (64 kB budget, `exl3_gemm_smem_bytes` ROCm branch): stock 1-4 = 13.0-62.8 kB;
+  new 5 (32×16×128 s4) = 34.5 kB @ b=8, 6 (48×16×128 s4) = 45.5 kB, 7 (32×16×256 s3) = 53.0 kB —
+  all bitrates fit; the gfx1150 128 kB/WGP gate was never needed. multiProcessorCount = 8 WGPs;
+  grids ≤ 8 blocks = 1/WGP → `EXL3_GRID_SYNC` safe (cf15c60 machinery inherited, OCC_MAX unset).
+- **The RDNA inner was already M-general in code** (all loops over TILEBLOCKS_M, partial tiles
+  predicated); only `static_assert(TILESIZE_M == 16)` + a stale comment guarded it. Landed
+  change = shape table + guard {16,32,48} + selection + tests — not a new kernel.
+- Selection: the **timing autotuner** is the real selector on both backends (CUDA's static
+  scorer never returns its shapes 5-7 either); new shapes become candidates automatically.
+  `COOP_AUTOTUNE_VERSION` bumped 4→5: tuned records are candidate-set specific, and the stale
+  `~/.cache/exllamav3/autotune` disk cache made the tuner pick shape 1 over 6 at m=100 (2×
+  mispick) until resalted. Overrides are mixed into the autotune hashes (disjoint arm records).
 
-## AUDIT FINDINGS (task 1) — complete, verified in source 2026-10-24
+## Landed
 
-### (a) WMMA vs emulation on gfx1150 → native WMMA is active (no pivot needed)
+- Shapes 5/6/7 for USE_ROCM (`quant/exl3_kernel_map.cuh`); guard lift
+  (`rocm/quant/exl3_gemm_inner_rdna.cuh`); `EXL3_GEMM_SHAPE` (force index) / `EXL3_GEMM_SHAPE_M`
+  (row-tile class filter over autotuner candidates, 16 = exact old table) with empty-set
+  fallback (`quant/exl3_gemm.cu`, also mgemm + smem lowering); scorer M-term
+  (`quant/exl3_kernel_map.cu`).
+- Tests `tests/kernels/gemm/test_exl3_gemm_multirow.py`: 15/15 green (band M×N×codebooks vs
+  fp64 + real 2.05 bpw tensors). Full kernels+graph suite: **4953 passed / 0 failed**.
+- Harnesses: `tools/bench_multirow.py`, `tests/par_multirow.py`, `tools/jit_build_wt.py`.
 
-- Gate: `rocm/rdna_wmma_emu.cuh:8-9` — `EXL3_WMMA_EMULATED` is defined only when
-  `__HIP_DEVICE_COMPILE__ && !__GFX11__ && !__GFX12__`. gfx1150 is a gfx11 target (clang
-  defines `__GFX11__`), so the emulator is compiled out and
-  `rocm/rdna_wmma.cuh` uses the native `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`.
-- The RDNA GEMM inner (`rocm/quant/exl3_gemm_inner_rdna.cuh:62`) includes `../rdna_wmma.cuh`,
-  so the EXL3 GEMM mainloop rides native WMMA. Runtime confirmation still to do post-build:
-  (i) preprocessor probe with the exact hipcc flags, (ii) EXL3_DEBUG_AUTOTUNE + µbench
-  throughput sanity (~native TFLOP/s, not ~1/10 of it), (iii) optional ISA grep of the built
-  code object for v_wmma encoding.
-- Structure of the RDNA inner (read in full): 3-stage software pipeline, **synchronous**
-  global→LDS copies (no cp.async on RDNA — header note 4), B dequant → LDS transpose →
-  WMMA `load_matrix_b`, split-K via global locks, `EXL3_GRID_SYNC()` device barrier in the
-  wrapper (`quant/exl3_gemm_kernel.cuh`) after the input Hadamard and between M-tile chunks.
+## Results (details + tables in PLAN-opt-multirow.md)
 
-### (b) LDS per workgroup, current shapes (derived with the file's own accounting,
-`exl3_gemm_smem_bytes()` ROCm branch in `quant/exl3_kernel_map.cuh:171-200`; the kernel's
-static_assert asserts host/device agree, so this IS the launch request modulo DevCtx cap).
+- µbench (forced shapes, real tensors): N=640 family (old table tile-starved) **1.63-2.39×**
+  at M ∈ [32,144]; wide-N family +19-31 % (shape 7). Autotuner harvests per (m,k,n) → no
+  regression anywhere.
+- e2E qwen 2.05: pp512/2048 ±5 % noise (**zero band exposure**: chunk 2048, reconstruct >144 —
+  the plan's pp512 premise mis-read the chunking); tail-chunk prompts ±0.5 %; **fully in-band
+  prompt (131 tok) +17.1 %**; decode neutral (+1.5 %).
+- Parity re-classed with evidence: same config = byte-identical (determinism); **two old-table
+  shape-1 configs with different grids diverge 4/4 rows** — greedy output was never stable
+  across grid changes (split-K fp32 regrouping); numerics class proven vs fp64. Zero-divergence
+  across shape tables is not an achievable invariant for ANY shape change.
 
-Formula (bytes): `SH_STAGES*(2*sh_a + 2*sh_b) + 2*sh_b_dq + 4*sh_c` where
-`sh_a = TILESIZE_M*(TILESIZE_K+8)` halfs, `sh_b = (K/16)*(N/16)*(16*bits)` uint16,
-`sh_b_dq = 8*(K/16)*16*18` halfs, `sh_c = max(0, N*M)` floats (shmem_out_had=true bound;
-the GEMM passes true, MoE false).
+## Landmines (for any follow-up)
 
-| shape (M,K,N,stages) | b=2 | b=4 | b=8 | note |
-|---|---|---|---|---|
-| 1 (16,16,128,4)  | 13.3 kB | 14.3 kB | 18.4 kB | not selected by scorer |
-| 2 (16,16,256,3)  | 25.8 kB | 28.8 kB | 41.0 kB | |
-| 3 (16,16,384,3)  | 35.3 kB | 39.8 kB | 53.4 kB | |
-| 4 (16,16,512,3)  | 44.8 kB | 50.8 kB | 62.8 kB | b=8 within 11 kB of the 64 kB cap — why stages=3 |
-| **5 (32,16,128,4)** | **28.5 kB** | **30.5 kB** | **34.5 kB** | LANDED; fits at all bitrates, no __GFX11__ 128 kB LDS needed |
-| **6 (48,16,128,4)** | 39.9 kB | 41.9 kB | 45.5 kB | LANDED (round 2) |
-| **7 (32,16,256,3)** | 44.7 kB | 47.7 kB | 53.0 kB | LANDED (round 2, wider N for multirow) |
-
-Method note: exact per-shape bytes are also computable at runtime via
-`ext.exl3_gemm_shape_smem(idx, K, half_k)` (not exposed to python; the constexpr in the
-header is the single source). Occupancy: the launch path clamps RDNA grids to 1 block/WGP
-(EXL3_RDNA_OCC_MAX default 1, `quant/exl3_gemm.cu:345-352`) because the kernel grid-syncs;
-leave unset. `EXL3_DEBUG_AUTOTUNE=1` prints occ_api per candidate for the runtime numbers.
-
-### Key structural discovery (changes the shape of the work)
-
-`rocm/quant/exl3_gemm_inner_rdna.cuh` is **already M-general in code**: every loop
-(`load_a` predication, `frag_a[FRAG_STAGES][TILEBLOCKS_M]`, `frag_c[TILEBLOCKS_M][…]`,
-`matmul`, `read/write_sum_gl`, `write_sum_tile_sh`, `output_had_sh_gl`) iterates
-TILEBLOCKS_M = TILESIZE_M/16 and predicates on the runtime row count. The only M=16 guard
-is `static_assert(TILESIZE_M == 16)` at line 137 + the comment "the 32/64-row MoE tiles are
-NOT ported; the static_assert is the guard". So this plan is: lift the assert, add the
-shape(s) to the table, verify, measure — NOT a new kernel. The B-fragment decode amortizes
-across TILEBLOCKS_M rows inside `load_frags` (frag_b shared over m) — exactly the CUDA
-shapes 5-7 mechanism.
-
-### Selection logic (how shapes are really picked)
-
-- Runtime default = **timing autotuner** (`CoopKernelAutotuner`, `quant/exl3_gemm.cu:310-377`):
-  candidates = every `exl3_gemm_shape_compat` shape, timed, cached by
-  `gemm_autotune_hash(MAX(size_m,2), size_k, size_n, K, …)` (+ RDNA salt). New table shapes
-  become candidates automatically. The M-rule in `exl3_gemm_shape_compat`
-  (`exl3_kernel_map.cu:189`: wide tile skipped when `size_m <= tilesize_m/2`) keeps M≤16 on
-  16-row shapes.
-- On CUDA, `select_gemm_shape` (static scorer) NEVER returns 5-7 either — the autotuner is
-  the selector there too; the scorer only fires in the `force_num_sms` path.
-- `ext.exl3_gemm` binding takes `force_shape_idx` positionally (arg 7) — the µbench and the
-  shape tests can pin shapes without any env machinery.
-- E2E A/B override: adding `EXL3_GEMM_SHAPE` (index) / `EXL3_GEMM_SHAPE_M` (tile M) env,
-  honored as force_shape_idx in `exl3_gemm_gr` (skips GEMV + autotuner; TORCH_CHECKed
-  divisibility/smem; grid = num_sms ≤ 1 block/WGP so grid-sync co-residency holds).
-
-### CRITICAL build hazard (differs from plans 02/04/05/06 — all python-side)
-
-The .venv editable install puts the MAIN checkout root on sys.path, so
-`import exllamav3_ext` resolves to the MAIN tree's prebuilt HIP .so and
-`exllamav3/ext.py` prefers it (`is_precompiled_extension_available`). For kernel-source
-changes this silently benches the wrong build. Fix in this worktree:
-`tools/jit_build_wt.py` scrubs the main-tree sys.path entries before importing → JIT-builds
-this worktree's sources into `$TORCH_EXTENSIONS_DIR`; afterwards put the output directory
-FIRST on PYTHONPATH. Server verification: grep `/proc/<pid>/maps` for the .so path.
-
-## Status / next steps
-
-- [x] Audit (a) WMMA native on gfx1150 — no pivot. (b) LDS table above.
-- [x] Worktree + isolated JIT build path (tools/jit_build_wt.py)
-- [ ] Stock build green (in progress — long, ccache warm)
-- [ ] Baseline test suite (tests/kernels at minimum) green with stock build
-- [x] Shapes 5/6/7 landed behind stock LDS accounting; static_assert admits TILESIZE_M ∈ {16,32,48}
-- [x] Selection: autotuner candidacy (automatic) + EXL3_GEMM_SHAPE / EXL3_GEMM_SHAPE_M override + scorer M-term
-- [x] Correctness: 15/15 new tests green (band M × N × {3inst@4b, mul1@2.5b} + real ckpt tensors);
-      full kernels+graph suite 926 passed (stock+shape5 build; re-run for 5/6/7)
-- [~] µbench round 1 (shape 5 only, /tmp/opencode/bench_multirow.log): N=640 tensors
-      (sh_gate K=4, idx_qk K=2 — old table had ONLY N=128 tiles there): shape 5 beats best
-      16-row shape 1.60-1.79x at M ∈ {32,64,144}, 1.34-1.42x at M ∈ {33,48} (two M-chunks);
-      N=2560 tensor (sh_down): shape 4 (16x16x512) still wins by 3-28% -> autotuner keeps
-      shape 4 there, no regression. Round 2 adds 6R (48-row, firms M 33..96) + 7R (32x256).
-- [ ] E2E (only if µbench passes) + greedy parity
-- [ ] Report PLAN-opt-multirow.md (local-llm root), INDEX row, final commit
-
-## Landmines
-
-- NEVER let a bench import the main tree's .so (see hazard above); check
-  `ext.exllamav3_ext.__file__` startswith the worktree/.torch_ext.
-- The autotuner caches by (size_m, k, n, K, …) — env overrides must be set before the
-  first launch of a process; one arm per process.
-- `wt_run_tests.py` requires TORCH_EXTENSIONS_DIR inside the worktree (it asserts).
-- ollama runs in background: ±5% e2e noise; serialized GPU benches, same-window A/B,
-  discard first run after each server start.
+- Kernel-source worktrees MUST use `tools/jit_build_wt.py` + PYTHONPATH-first ext dir; the
+  editable install otherwise silently imports the MAIN tree's prebuilt `.so` (verified via
+  `/proc/<pid>/maps` for servers).
+- Env overrides are read once per process → one arm per process.
+- `EXLLAMAV3_TUNE_CACHE` / version bump: any future shape-table edit must bump
+  `COOP_AUTOTUNE_VERSION` again.
+- 65_bench: PROMPT_STYLE=real inflates prompt length (96→167 via chat template) — synthetic
+  style + small targets to hit the band; repeated seed+size across runs = server prompt-cache
+  hits (warmup runs poison the next measured run at the same sizes).
