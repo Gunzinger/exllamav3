@@ -356,8 +356,9 @@ def cpu_prefill_cache_bytes() -> int:
 #                                          stock moe_mul1 grouped kernel, byte-identically)
 # When "torch", a prefill chunk's experts whose routed row count reaches EXL3_CPU_PREFILL_MIN_M
 # dequantize gate/up/down to BF16 (the shared AVX-512 binding; per chunk — the routed-expert
-# BF16 working set is ~220 GiB on qwen 2.05 vs any cache budget, so the shadow cache is
-# bypassed for routed experts by measured decision, PLAN-cpu-bf16-prefill.md) and take
+# BF16 working set is ~212 GiB on qwen 2.05 (512 experts x 9.375 MiB x 47 MoE layers) vs any
+# cache budget, so the shadow cache is bypassed for routed experts by measured decision,
+# PLAN-cpu-bf16-prefill.md) and take
 # torch.matmul in power-of-2 row-count buckets (T2.4-style regular batched shapes); every
 # other assignment stays on the stock grouped kernel through a masked (-1) selection tail.
 # Rows the tier does not touch are computed by exactly the un-tiered kernel call; decode

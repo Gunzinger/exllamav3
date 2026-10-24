@@ -435,7 +435,7 @@ def trellis_rate(tile_width: int):
 # stays on the stock grouped kernel through a masked (-1) selection tail, which reproduces the
 # un-tiered kernel call exactly for the rows it computes. The shadow cache is deliberately
 # bypassed for routed experts (per-chunk dequant): the routed-expert BF16 working set is
-# ~220 GiB on qwen 2.05 (512 experts x 9.375 MiB x 47 layers) vs any cache budget — the
+# ~212 GiB on qwen 2.05 (512 experts x 9.375 MiB x 47 MoE layers) vs any cache budget — the
 # plan-04 lesson (working set > budget = 0% hits) applies wholesale; the decision and its
 # measured trade are documented in PLAN-cpu-bf16-prefill.md §MoE tier.
 # -------------------------------------------------------------------------------------------
