@@ -48,9 +48,9 @@ the GEMM passes true, MoE false).
 | 2 (16,16,256,3)  | 25.8 kB | 28.8 kB | 41.0 kB | |
 | 3 (16,16,384,3)  | 35.3 kB | 39.8 kB | 53.4 kB | |
 | 4 (16,16,512,3)  | 44.8 kB | 50.8 kB | 62.8 kB | b=8 within 11 kB of the 64 kB cap — why stages=3 |
-| **5R (32,16,128,4)** | **28.5 kB** | **30.5 kB** | **35.3 kB** | proposed; fits at all bitrates, no __GFX11__ 128 kB LDS needed |
-| (48,16,128,4)    | 42.8 kB | 45.8 kB | 52.3 kB | 6R candidate, fits too |
-| (64,16,128,4)    | 57.0 kB | 61.0 kB | 69.3 kB | b=8 overflows 64 kB → S=3 for 8R, or gate deeper LDS |
+| **5 (32,16,128,4)** | **28.5 kB** | **30.5 kB** | **34.5 kB** | LANDED; fits at all bitrates, no __GFX11__ 128 kB LDS needed |
+| **6 (48,16,128,4)** | 39.9 kB | 41.9 kB | 45.5 kB | LANDED (round 2) |
+| **7 (32,16,256,3)** | 44.7 kB | 47.7 kB | 53.0 kB | LANDED (round 2, wider N for multirow) |
 
 Method note: exact per-shape bytes are also computable at runtime via
 `ext.exl3_gemm_shape_smem(idx, K, half_k)` (not exposed to python; the constexpr in the
@@ -102,10 +102,15 @@ FIRST on PYTHONPATH. Server verification: grep `/proc/<pid>/maps` for the .so pa
 - [x] Worktree + isolated JIT build path (tools/jit_build_wt.py)
 - [ ] Stock build green (in progress — long, ccache warm)
 - [ ] Baseline test suite (tests/kernels at minimum) green with stock build
-- [ ] Shape 5R (32,16,128,4,3) landed behind stock LDS accounting; static_assert lifted
-- [ ] Selection: autotuner candidacy (automatic) + env override + scorer M-bonus
-- [ ] Correctness: extended shape tests, M ∈ {16,17,31,32,33,64,100,144} × N ∈ {128,2560,4096}
-- [ ] µbench go/no-go ≥1.5× at M ∈ [32,144] (real 2.05bpw tensor)
+- [x] Shapes 5/6/7 landed behind stock LDS accounting; static_assert admits TILESIZE_M ∈ {16,32,48}
+- [x] Selection: autotuner candidacy (automatic) + EXL3_GEMM_SHAPE / EXL3_GEMM_SHAPE_M override + scorer M-term
+- [x] Correctness: 15/15 new tests green (band M × N × {3inst@4b, mul1@2.5b} + real ckpt tensors);
+      full kernels+graph suite 926 passed (stock+shape5 build; re-run for 5/6/7)
+- [~] µbench round 1 (shape 5 only, /tmp/opencode/bench_multirow.log): N=640 tensors
+      (sh_gate K=4, idx_qk K=2 — old table had ONLY N=128 tiles there): shape 5 beats best
+      16-row shape 1.60-1.79x at M ∈ {32,64,144}, 1.34-1.42x at M ∈ {33,48} (two M-chunks);
+      N=2560 tensor (sh_down): shape 4 (16x16x512) still wins by 3-28% -> autotuner keeps
+      shape 4 there, no regression. Round 2 adds 6R (48-row, firms M 33..96) + 7R (32x256).
 - [ ] E2E (only if µbench passes) + greedy parity
 - [ ] Report PLAN-opt-multirow.md (local-llm root), INDEX row, final commit
 

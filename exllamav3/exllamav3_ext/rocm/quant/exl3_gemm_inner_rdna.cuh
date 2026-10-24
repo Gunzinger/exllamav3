@@ -2,9 +2,9 @@
 // exl3_gemm_inner for RDNA 3.5
 //
 // size_n_stride / blocks_n_full for sliced mgemm are mirrored from
-// quant/exl3_gemm_inner.cuh. TILESIZE_M is 16 or 32: every stage of the tile is written
+// quant/exl3_gemm_inner.cuh. TILESIZE_M is 16, 32 or 48: every stage of the tile is written
 // against TILEBLOCKS_M = TILESIZE_M / 16 (A load predication, fragment arrays, the matmul
-// and every output path), so a second 16-row block rides the same B fragments -- the
+// and every output path), so multiple 16-row blocks ride the same B fragments -- the
 // multi-row amortization the CUDA table's shapes 5-7 are built on. static_assert(TILESIZE_M)
 // below admits exactly the row tiles the shape table instantiates.
 // =============================================================================
@@ -137,7 +137,7 @@ void exl3_gemm_kernel_inner
     // does not need: with TILESIZE_N = 192 the
     // integer division below silently drops a third of the output tile.
     static_assert(EXL3_GEMM_BASE_THREADS == 256, "Invalid kernel params");
-    static_assert(TILESIZE_M == 16 || TILESIZE_M == 32, "Invalid kernel params");
+    static_assert(TILESIZE_M == 16 || TILESIZE_M == 32 || TILESIZE_M == 48, "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert(TILEBLOCKS_N % NUM_WARPS == 0,

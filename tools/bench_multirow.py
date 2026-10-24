@@ -26,10 +26,11 @@ MDIR = os.environ.get(
 SHARD = "model-00001-of-00005.safetensors"
 PFX = "model.language_model.layers.3"
 TENSORS = {
-    # name -> (key, K, N); N/K from the checkpoint dims (hidden 2560, moe_inter 640)
-    "sh_gate": (f"{PFX}.mlp.shared_expert.gate_proj", 2560, 640),
-    "sh_down": (f"{PFX}.mlp.shared_expert.down_proj", 640, 2560),
-    "idx_qk": (f"{PFX}.self_attn.indexer.index_qk_proj", None, None),  # dims from tensor
+    # name -> (key, expected N or None); K and dims come from the checkpoint (the model
+    # mixes bitrates per tensor family: shared_expert is 4.05bpw-class, routed 2.05)
+    "sh_gate": (f"{PFX}.mlp.shared_expert.gate_proj", None),
+    "sh_down": (f"{PFX}.mlp.shared_expert.down_proj", None),
+    "idx_qk": (f"{PFX}.self_attn.indexer.index_qk_proj", None),
 }
 M_SWEEP = [16, 17, 24, 32, 33, 48, 64, 100, 128, 144]
 ITERS = 50
@@ -45,8 +46,8 @@ def load_bc(prefix, K_known, N_known):
         mul1 = f.get_tensor(f"{prefix}.mul1").cuda()
     K = int(trellis.shape[-1] // 16)
     in_f, out_f = trellis.shape[0] * 16, trellis.shape[1] * 16
-    if K_known is not None:
-        assert K == K_known and out_f == N_known, (K, out_f, K_known, N_known)
+    if N_known is not None:
+        assert out_f == N_known, (out_f, N_known)
     x0 = torch.zeros(1, in_f, dtype=torch.half, device="cuda")
     bc = ext.BC_LinearEXL3(trellis, suh, svh, K, None, False, bool(mul1.item()), x0)
     return ext, bc, trellis, suh, svh, bool(mul1.item()), in_f, out_f, K
@@ -85,8 +86,8 @@ def main():
     print(f"# num shapes: {n_shapes}", flush=True)
 
     rows = []
-    for name, (key, Kk, Nk) in TENSORS.items():
-        ext_, bc, trellis, suh, svh, mul1, in_f, out_f, K = load_bc(key, Kk, Nk)
+    for name, (key, Nk) in TENSORS.items():
+        ext_, bc, trellis, suh, svh, mul1, in_f, out_f, K = load_bc(key, None, Nk)
         print(f"\n== {name}: K={K} in={in_f} out={out_f} mul1={mul1} "
               f"(trellis {tuple(trellis.shape)})", flush=True)
         hdr = f"{'M':>5} |" + "".join(f"   shape{s:>2} " for s in shapes) + "|  best old -> best new   speedup"
