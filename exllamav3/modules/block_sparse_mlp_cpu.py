@@ -427,6 +427,153 @@ def trellis_rate(tile_width: int):
     return None
 
 
+# -------------------------------------------------------------------------------------------
+# CPU prefill MoE tier (Plan 07 §Design 3; EXL3_CPU_PREFILL_MOE=torch, default off — knobs in
+# util/cuda_flags.py). Per prefill chunk: experts whose routed row count reaches
+# EXL3_CPU_PREFILL_MIN_M dequantize to BF16 (the shared AVX-512 binding) and run torch.matmul
+# in power-of-2 row-count buckets (T2.4-style regular batched shapes); every other assignment
+# stays on the stock grouped kernel through a masked (-1) selection tail, which reproduces the
+# un-tiered kernel call exactly for the rows it computes. The shadow cache is deliberately
+# bypassed for routed experts (per-chunk dequant): the routed-expert BF16 working set is
+# ~220 GiB on qwen 2.05 (512 experts x 9.375 MiB x 47 layers) vs any cache budget — the
+# plan-04 lesson (working set > budget = 0% hits) applies wholesale; the decision and its
+# measured trade are documented in PLAN-cpu-bf16-prefill.md §MoE tier.
+# -------------------------------------------------------------------------------------------
+_moe_act_id = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}
+_moe_tier_subbatch = 64   # experts per stacked bmm: caps the transient BF16 weight stack
+                          # (~630 MB at qwen 2.05 dims)
+
+
+def _moe_tier_activation(activation: int, g: torch.Tensor, u: torch.Tensor, limit: float):
+    """fp32 elementwise mirror of moe_mul1.cpp apply_activation — same clamps in the same
+    order (up symmetric, activated gate from above, strictly BEFORE the multiply), same
+    exp() overflow guard."""
+    if activation == 0:      # silu
+        lim = limit if limit != 0.0 else float("inf")
+        a = g / (1.0 + torch.exp((-g).clamp(max = 80.0)))
+        return a.clamp(max = lim) * u.clamp(min = -lim, max = lim)
+    if activation == 1:      # gelu (tanh approximation never enters the CPU kernel)
+        lim = limit if limit != 0.0 else float("inf")
+        cdf = 0.5 * (1.0 + torch.erf(g * 0.70710678))
+        return (g * cdf).clamp(max = lim) * u.clamp(min = -lim, max = lim)
+    if activation == 3:      # gpt-oss clamped swiglu: g = min(g, lim); (clamp(u) + 1) * g * sigmoid(1.702 g)
+        gv = g.clamp(max = limit)
+        return (u.clamp(min = -limit, max = limit) + 1.0) * gv * torch.sigmoid(1.702 * gv)
+    a = u.clamp(min = 0.0)   # relu2 (gateless; act_limit not applied, same as the kernel)
+    return a * a
+
+
+def _moe_tier_forward(module, y: torch.Tensor, selected_experts: torch.Tensor,
+                      routing_weights: torch.Tensor, out: torch.Tensor) -> bool:
+    """The tiered forward. Returns True when it wrote `out` in full; False when the caller
+    must run the stock kernel instead (no expert reaches MIN_M — including every decode
+    call, gated out by the caller's rows < MIN_M check before we are ever invoked)."""
+    import time
+    from ..util import cuda_flags as _cf
+    from .quant.exl3 import _dequant_weights
+    dbg = os.environ.get("EXL3_CPU_PREFILL_MOE_DEBUG", "0") != "0"
+    t_all = time.perf_counter()
+    E = module.num_local_experts
+    topk = selected_experts.shape[1]
+    rows, H = y.shape
+    min_m = _cf.cpu_prefill_min_m()
+    flat = selected_experts.reshape(-1)
+    # Host histogram (the one sync of the tier); invalid ids skip exactly like the kernel's
+    # selection loop (e < 0 || e >= E never counts)
+    valid = (flat >= 0) & (flat < E)
+    counts_h = torch.bincount(flat[valid], minlength = E).tolist()
+    hot = [e for e in range(E) if counts_h[e] >= min_m]
+    if dbg:
+        print(f" [moe-tier] rows {rows} topk {topk}: hot {len(hot)}/{E}, "
+              f"hot assignments {sum(counts_h[e] for e in hot)}/{int(valid.sum())}, "
+              f"max count {max(counts_h)}")
+    if not hot:
+        return False
+
+    # --- cold tail: mask tiered assignments to -1, compress to rows that still carry work,
+    # stock kernel exactly as an un-tiered call would compute them
+    t0 = time.perf_counter()
+    hot_table = torch.zeros(E + 1, dtype = torch.bool)   # entry E (and the sentinel 0-slot
+    for e in hot:                                        # for clamped invalid ids) stays False
+        hot_table[e] = True
+    is_hot = hot_table.index_select(0, flat.clamp(0, E)).view(rows, topk)
+    sel_tail = selected_experts.masked_fill(is_hot, -1)
+    keep = (sel_tail >= 0).any(dim = 1).nonzero(as_tuple = True)[0]
+    if keep.numel():
+        out_t = torch.empty((keep.numel(), H), dtype = torch.float)
+        ext.exl3_moe_cpu_forward(
+            module.cpu_layer_handle, y.index_select(0, keep),
+            sel_tail.index_select(0, keep).contiguous(),
+            routing_weights.index_select(0, keep).contiguous(), out_t, module.cpu_threads)
+        out.index_add_(0, keep, out_t)
+    t_tail = time.perf_counter() - t0
+
+    # --- hot experts: dequant per expert per chunk, power-of-2 row-count buckets
+    act_id = _moe_act_id[module.activation_fn]
+    limit = float(module.act_limit or 0.0)
+    order = torch.argsort(flat.clamp(0, E).masked_fill(~valid, E), stable = True)
+    tok_sorted = torch.div(order, topk, rounding_mode = "floor")
+    w_sorted = routing_weights.reshape(-1).index_select(0, order).float()
+    offs = [0]
+    for c in counts_h:
+        offs.append(offs[-1] + c)
+    buckets: dict = {}
+    for e in hot:   # next_pow2(count); count >= min_m so the bucket floor is min_m itself
+        b = 1 << (counts_h[e] - 1).bit_length()
+        buckets.setdefault(b, []).append(e)
+    t0 = time.perf_counter()
+    t_dq = 0.0
+    n_dq = 0
+    for b in sorted(buckets):
+        members = buckets[b]
+        for i0 in range(0, len(members), _moe_tier_subbatch):
+            grp = members[i0:i0 + _moe_tier_subbatch]
+            G = len(grp)
+            segs = []
+            idx = torch.zeros((G, b), dtype = torch.long)     # pad rows duplicate token 0 ...
+            wts = torch.zeros((G, b), dtype = torch.float)    # ... with weight 0, and their
+            for gi, e in enumerate(grp):                      # activations are zeroed below,
+                c = counts_h[e]                               # so their outputs are exactly 0
+                seg = slice(offs[e], offs[e + 1])
+                idx[gi, :c] = tok_sorted[seg]
+                wts[gi, :c] = w_sorted[seg]
+                segs.append(tok_sorted[seg])
+            xg = y.index_select(0, idx.reshape(-1)).view(G, b, H).to(torch.bfloat16)
+            dq = [[None, None, None] for _ in grp]
+            for gi, e in enumerate(grp):
+                for pi, ls in enumerate((module.gates, module.ups, module.downs) if module.gated
+                                        else (module.ups, module.downs)):
+                    t1 = time.perf_counter()
+                    inner = getattr(ls[e], "inner", ls[e])
+                    dq[gi][pi] = _dequant_weights(inner, False)[:inner.out_features]
+                    n_dq += 1
+                    t_dq += time.perf_counter() - t1
+            # slot layout: gated [gate, up, down]; gateless [up, down]
+            i_u, i_d = (1, 2) if module.gated else (0, 1)
+            def stack(pi):
+                return torch.stack([dq[gi][pi] for gi in range(G)])
+            w_u = stack(i_u)
+            w_d = stack(i_d)
+            u = torch.bmm(xg, w_u.transpose(1, 2)).float()
+            if module.gated:
+                w_g = stack(0)
+                g = torch.bmm(xg, w_g.transpose(1, 2)).float()
+            else:
+                g = u
+            a = _moe_tier_activation(act_id, g, u, limit)
+            d = torch.bmm(a.to(torch.bfloat16), w_d.transpose(1, 2)).float()
+            for gi, e in enumerate(grp):
+                c = counts_h[e]
+                out.index_add_(0, segs[gi], d[gi, :c] * wts[gi, :c].unsqueeze(1))
+            del dq, xg, w_u, w_d, u, g, a, d
+    t_moe = time.perf_counter() - t0
+    if dbg:
+        print(f" [moe-tier] buckets { {b: len(v) for b, v in sorted(buckets.items())} }, "
+              f"tail {t_tail * 1e3:.1f} ms, dequant {n_dq} mats {t_dq * 1e3:.1f} ms, "
+              f"bmm+scatter {t_moe * 1e3:.1f} ms, total {(time.perf_counter() - t_all) * 1e3:.1f} ms")
+    return True
+
+
 class BlockSparseMLP_CPU:
 
     def _cpu_init_state(self):
@@ -638,11 +785,25 @@ class BlockSparseMLP_CPU:
         if self.intermediate_size == 0 or self.num_local_experts == 0 or bsz == 0:
             final_hidden_states = torch.zeros((bsz, self.expert_size), dtype = torch.float)
         elif self.cpu_layer_handle is not None:
-            final_hidden_states = torch.empty((bsz, self.expert_size), dtype = torch.float)
-            ext.exl3_moe_cpu_forward(
-                self.cpu_layer_handle, y, selected_experts, routing_weights,
-                final_hidden_states, self.cpu_threads
-            )
+            from ..util import cuda_flags as _cf
+            # MoE prefill tier (EXL3_CPU_PREFILL_MOE=torch): the rows >= MIN_M gate is exact —
+            # a per-expert count is bounded by the chunk's row count, so decode (M = 1-3)
+            # never enters the tier and pays nothing. zeros only when the tier can partially
+            # write the output; the stock kernel memsets `out` itself.
+            if (_cf.cpu_prefill_moe() == "torch" and bsz >= _cf.cpu_prefill_min_m()):
+                final_hidden_states = torch.zeros((bsz, self.expert_size), dtype = torch.float)
+                if not _moe_tier_forward(self, y, selected_experts, routing_weights,
+                                         final_hidden_states):
+                    ext.exl3_moe_cpu_forward(
+                        self.cpu_layer_handle, y, selected_experts, routing_weights,
+                        final_hidden_states, self.cpu_threads
+                    )
+            else:
+                final_hidden_states = torch.empty((bsz, self.expert_size), dtype = torch.float)
+                ext.exl3_moe_cpu_forward(
+                    self.cpu_layer_handle, y, selected_experts, routing_weights,
+                    final_hidden_states, self.cpu_threads
+                )
         else:
             final_hidden_states = torch.zeros((bsz, self.expert_size), dtype = torch.float)
             for t in range(bsz):

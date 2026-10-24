@@ -348,3 +348,31 @@ def cpu_prefill_cache_bytes() -> int:
         return max(0, int(os.environ.get("EXL3_CPU_PREFILL_CACHE_MIB", "0"))) * 1024**2
     except ValueError:
         return 0
+
+
+# -------------------------------------------------------------------------------------------
+# CPU prefill MoE tier (Plan 07 §Design 3, the grouped path; opt-in, default off):
+#   EXL3_CPU_PREFILL_MOE     off | torch   (default off: the routed experts always run the
+#                                          stock moe_mul1 grouped kernel, byte-identically)
+# When "torch", a prefill chunk's experts whose routed row count reaches EXL3_CPU_PREFILL_MIN_M
+# dequantize gate/up/down to BF16 (the shared AVX-512 binding; per chunk — the routed-expert
+# BF16 working set is ~220 GiB on qwen 2.05 vs any cache budget, so the shadow cache is
+# bypassed for routed experts by measured decision, PLAN-cpu-bf16-prefill.md) and take
+# torch.matmul in power-of-2 row-count buckets (T2.4-style regular batched shapes); every
+# other assignment stays on the stock grouped kernel through a masked (-1) selection tail.
+# Rows the tier does not touch are computed by exactly the un-tiered kernel call; decode
+# (M = 1-3) never reaches the tier at all (a per-expert count is bounded by the chunk's row
+# count, so rows < MIN_M implies no eligible expert — the gate is exact and free).
+# The fp32 dequant variant stays linear-tier-only (routed experts keep the bf16 class).
+# Thread discipline: the tier's matmuls ride torch's intra-op pool, the dequant its own
+# std::thread strips, and the stock tail the EXL3_MOE_CPU_THREADS worker pool. The three run
+# strictly sequentially (tail completes before any tier work), so nothing oversubscribes —
+# but the pools size independently: EXL3_MOE_CPU_THREADS/PIN govern the tail exactly as
+# without the tier; OMP_NUM_THREADS etc. govern the tier's GEMMs.
+#   EXL3_CPU_PREFILL_MOE_DEBUG 1  print per-call hot/cold split, buckets and phase timings
+#                                 (prefill calls only — decode never enters the tier)
+# Values are re-read per call so tests and rollback need no reload.
+# -------------------------------------------------------------------------------------------
+def cpu_prefill_moe() -> str:
+    v = os.environ.get("EXL3_CPU_PREFILL_MOE", "off").strip().lower()
+    return v if v in ("off", "torch") else "off"
