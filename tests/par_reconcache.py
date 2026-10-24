@@ -92,6 +92,7 @@ def set_knob(mib: int | None):
 
 
 def run_pass(model, tokenizer, prompts, max_new, ctx, label):
+    import torch
     from exllamav3.generator.sampler.presets import ComboSampler
     from exllamav3 import Job, Cache, Generator
 
@@ -101,8 +102,9 @@ def run_pass(model, tokenizer, prompts, max_new, ctx, label):
     # 34.7 s — no prefill happened at all). The recon shadows live in the GLOBAL
     # recon_cache LRU, not in the Generator, so recreating Cache/Generator yields a
     # genuine cold-prefill pass 2 and a warm-shadow pass 3 without changing what the
-    # gate compares.
+    # gate compares. (Cache tensors are allocated post-load via cache.alloc().)
     cache = Cache(model, max_num_tokens=ctx, max_batch_size=1, max_history=0)
+    cache.alloc(torch.device("cuda:0"))
     gen = Generator(model, cache, tokenizer)
 
     prompt_budget = ctx - max_new - 16
@@ -129,7 +131,9 @@ def run_pass(model, tokenizer, prompts, max_new, ctx, label):
         out[f"row{i}"] = {"in_len": int(ids.numel()), "tokens": toks}
         print(f"  [{label}] row{i}: in={int(ids.numel())} out={len(toks)} "
               f"head={toks[:6]} ({time.perf_counter() - t0:.1f}s)", flush=True)
-    del gen, cache
+    del gen
+    cache.free()
+    del cache
     return out
 
 
