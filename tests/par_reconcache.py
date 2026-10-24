@@ -91,9 +91,19 @@ def set_knob(mib: int | None):
     return recon_cache.stats()
 
 
-def run_pass(model, tokenizer, gen, prompts, max_new, ctx, label):
+def run_pass(model, tokenizer, prompts, max_new, ctx, label):
     from exllamav3.generator.sampler.presets import ComboSampler
-    from exllamav3 import Job
+    from exllamav3 import Job, Cache, Generator
+
+    # FRESH Cache + Generator per pass: the Generator keeps resumable KV pages keyed
+    # by prompt hash, so a second pass over identical prompts would be served from the
+    # *prompt* cache and never re-prefill (measured: on-cold row0 27.1 s vs off
+    # 34.7 s — no prefill happened at all). The recon shadows live in the GLOBAL
+    # recon_cache LRU, not in the Generator, so recreating Cache/Generator yields a
+    # genuine cold-prefill pass 2 and a warm-shadow pass 3 without changing what the
+    # gate compares.
+    cache = Cache(model, max_num_tokens=ctx, max_batch_size=1, max_history=0)
+    gen = Generator(model, cache, tokenizer)
 
     prompt_budget = ctx - max_new - 16
     sampler = ComboSampler(temperature=0.0, top_p=1.0, top_k=0)
@@ -119,6 +129,7 @@ def run_pass(model, tokenizer, gen, prompts, max_new, ctx, label):
         out[f"row{i}"] = {"in_len": int(ids.numel()), "tokens": toks}
         print(f"  [{label}] row{i}: in={int(ids.numel())} out={len(toks)} "
               f"head={toks[:6]} ({time.perf_counter() - t0:.1f}s)", flush=True)
+    del gen, cache
     return out
 
 
@@ -130,8 +141,6 @@ def run_generation(model_dir, mode, rows, max_new, ctx, qbench_path):
     config = Config.from_directory(model_dir)
     tokenizer = Tokenizer.from_config(config)
     model = Model.from_config(config)
-    cache = Cache(model, max_num_tokens=ctx, max_batch_size=1, max_history=0)
-    gen = Generator(model, cache, tokenizer)
     t0 = time.perf_counter()
     model.load(torch.device("cuda:0"))
     print(f"[load] {time.perf_counter() - t0:.1f}s", flush=True)
@@ -155,13 +164,13 @@ def run_generation(model_dir, mode, rows, max_new, ctx, qbench_path):
 
     stats_off = set_knob(None)
     print(f"[knob] off  stats={stats_off}", flush=True)
-    p_off = run_pass(model, tokenizer, gen, prompts, max_new, ctx, "off")
-    # free the off-pass KV/generator state implicitly; flip the knob on
+    p_off = run_pass(model, tokenizer, prompts, max_new, ctx, "off")
+    # flip the knob on; pass 2 re-prefills cold (fresh Cache) and materializes shadows
     stats_cold0 = set_knob(4096)
-    p_cold = run_pass(model, tokenizer, gen, prompts, max_new, ctx, "on-cold")
+    p_cold = run_pass(model, tokenizer, prompts, max_new, ctx, "on-cold")
     stats_cold = recon_cache.stats()
     print(f"[knob] on   stats before={stats_cold0} after={stats_cold}", flush=True)
-    p_warm = run_pass(model, tokenizer, gen, prompts, max_new, ctx, "on-warm")
+    p_warm = run_pass(model, tokenizer, prompts, max_new, ctx, "on-warm")
     stats_warm = recon_cache.stats()
     print(f"[knob] on   stats after warm pass={stats_warm}", flush=True)
 
