@@ -55,6 +55,22 @@ uint64_t roundup_pow2(uint64_t x)
     return x + 1;
 }
 
+#if defined(USE_ROCM)
+// opt03: shape-class override (see exl3_gemm_gr). File scope so the autotune hashes can mix
+// the override in: tuned records are candidate-set specific, and two arms of an A/B (or a
+// user flipping the env) must not read each other's winners.
+static const int exl3_env_gemm_shape = []
+{
+    const char* e = std::getenv("EXL3_GEMM_SHAPE");
+    return (e && atoi(e) > 0) ? atoi(e) : 0;
+}();
+static const int exl3_env_gemm_shape_m = []
+{
+    const char* e = std::getenv("EXL3_GEMM_SHAPE_M");
+    return (e && atoi(e) > 0) ? atoi(e) : 0;
+}();
+#endif
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -86,6 +102,11 @@ uint64_t gemm_autotune_hash
     mix((uint64_t) cc);
     mix((uint64_t) max_num_sms);
     mix((uint64_t) cb);
+#if defined(USE_ROCM)
+    // opt03: the override restricts the candidate set, so its records live under their own keys
+    mix((uint64_t) exl3_env_gemm_shape);
+    mix((uint64_t) exl3_env_gemm_shape_m);
+#endif
     return h;
 }
 
@@ -201,25 +222,14 @@ int exl3_gemm_gr
     }
 
 #if defined(USE_ROCM)
-    // opt03: pin the GEMM shape for A/B runs -- EXL3_GEMM_SHAPE = shape index (1..N), or
-    // EXL3_GEMM_SHAPE_M = row-tile size (16, 32, ...; first shape with that row tile). Applied
-    // as force_shape_idx, which skips the GEMV paths and the timing autotuner; divisibility and
-    // shared-memory fit are TORCH_CHECKed by select_exl3_gemm_kernel. Unset = stock behavior.
-    // Read once per process: the autotune cache and graph capture assume a stable shape for the
-    // lifetime of the caller, so arms are separate process runs (same build, env flip only).
-    static const int env_shape = []
-    {
-        const char* e = std::getenv("EXL3_GEMM_SHAPE");
-        if (e && atoi(e) > 0) return atoi(e);
-        if ((e = std::getenv("EXL3_GEMM_SHAPE_M")))
-        {
-            int m = atoi(e);
-            for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
-                if (exl3_gemm_tilesize_m_g[s] == m) return s;
-        }
-        return 0;
-    }();
-    if (env_shape > 0 && force_shape_idx <= 0) force_shape_idx = env_shape;
+    // opt03: pin the GEMM shape class for A/B runs -- EXL3_GEMM_SHAPE = one shape index
+    // (1..N, forced verbatim), or EXL3_GEMM_SHAPE_M = row-tile size (16, 32, 48), which
+    // restricts the timing autotuner's candidates to shapes with that row tile: 16 is exactly
+    // the pre-5/6/7 table, 32 covers the 32-row tiles (N 128 and 256), 48 the 48-row one.
+    // Unset = stock behavior (autotuner over every compatible shape). The overrides are read
+    // once per process (statics above) and mixed into the autotune hashes, so arms are separate
+    // process runs (same build, env flip only) with disjoint tune-cache records.
+    if (exl3_env_gemm_shape > 0 && force_shape_idx <= 0) force_shape_idx = exl3_env_gemm_shape;
 
     // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
     // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
@@ -322,8 +332,11 @@ int exl3_gemm_gr
     {
         int need = 0;
         for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
-            if (exl3_gemm_shape_compat(s, size_m, size_k, size_n, K, half_k))
-                need = MAX(need, exl3_gemm_shape_smem(s, K, half_k));
+        {
+            if (!exl3_gemm_shape_compat(s, size_m, size_k, size_n, K, half_k)) continue;
+            if (exl3_env_gemm_shape_m > 0 && exl3_gemm_tilesize_m_g[s] != exl3_env_gemm_shape_m) continue;
+            need = MAX(need, exl3_gemm_shape_smem(s, K, half_k));
+        }
         if (need > 0 && need < smem_max) smem_max = need;
     }
 #endif
@@ -343,9 +356,22 @@ int exl3_gemm_gr
             return tuned.tag;
         }
         std::vector<CoopAutotuneCandidate> candidates;
+        // opt03: shape-class filter; falls back to the full set when no shape of the requested
+        // row tile is compatible (e.g. tile_m 32 at size_m <= 16, where the compat rule already
+        // excludes the multi-row shapes)
+        int shape_m_filter = exl3_env_gemm_shape_m;
+        if (shape_m_filter > 0)
+        {
+            bool any = false;
+            for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES && !any; ++s)
+                any = exl3_gemm_tilesize_m_g[s] == shape_m_filter
+                   && exl3_gemm_shape_compat(s, size_m, size_k, size_n, K, half_k);
+            if (!any) shape_m_filter = 0;
+        }
         for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
+            if (shape_m_filter > 0 && exl3_gemm_tilesize_m_g[candidate_shape_idx] != shape_m_filter) continue;
 
             fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
             if (!candidate_kernel) continue;
@@ -784,10 +810,21 @@ int exl3_mgemm_gr
         }
         if (!graph)
         {
+            // opt03: same shape-class override as exl3_gemm_gr (EXL3_GEMM_SHAPE / _M)
             std::vector<CoopAutotuneCandidate> candidates;
+            int shape_m_filter = exl3_env_gemm_shape_m;
+            if (shape_m_filter > 0)
+            {
+                bool any = false;
+                for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES && !any; ++s)
+                    any = exl3_gemm_tilesize_m_g[s] == shape_m_filter
+                       && exl3_gemm_shape_compat(s, size_m, size_k, size_n, K, half_k);
+                if (!any) shape_m_filter = 0;
+            }
             for (int candidate_shape_idx = 1; candidate_shape_idx <= EXL3_GEMM_NUM_SHAPES; ++candidate_shape_idx)
             {
                 if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K, half_k)) continue;
+                if (shape_m_filter > 0 && exl3_gemm_tilesize_m_g[candidate_shape_idx] != shape_m_filter) continue;
 
                 fp_exl3_mgemm_kernel candidate_kernel = get_mgemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
                 if (!candidate_kernel) continue;
