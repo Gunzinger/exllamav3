@@ -222,7 +222,7 @@ def compare_tokens(a_path, b_path):
 def compare_states(a_path, b_path):
     import torch
 
-    GATE = {"float": 1e-3, "half": 5e-3}
+    GATE = {"float": 1e-3, "float32": 1e-3, "half": 5e-3, "float16": 5e-3}
     a = torch.load(a_path, weights_only=False)
     b = torch.load(b_path, weights_only=False)
     assert a["prompt_len"] == b["prompt_len"], "prompt lengths differ"
