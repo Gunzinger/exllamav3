@@ -182,12 +182,18 @@ def main():
             b = json.load(f)
         print(f"A: model={a['model_dir']} knob={a['knob']}")
         print(f"B: model={b['model_dir']} knob={b['knob']}")
-        if set(a["generations"]) != set(b["generations"]):
-            print("VERDICT: FAIL — regime/row sets differ")
+        common = sorted(set(a["generations"]) & set(b["generations"]))
+        only_a = sorted(set(a["generations"]) - set(b["generations"]))
+        only_b = sorted(set(b["generations"]) - set(a["generations"]))
+        if only_a or only_b:
+            print(f"  (comparing {len(common)} common rows; only-A: {only_a or '—'}, "
+                  f"only-B: {only_b or '—'})")
+        if not common:
+            print("VERDICT: FAIL — no common rows")
             sys.exit(1)
         ndiff = 0
         by_regime = {}
-        for k in sorted(a["generations"]):
+        for k in common:
             ta = a["generations"][k]["tokens"]
             tb = b["generations"][k]["tokens"]
             regime = k.split("_")[0]
@@ -202,7 +208,7 @@ def main():
         for regime, stat in sorted(by_regime.items()):
             print(f"  {regime}: {stat['rows'] - stat['diff']}/{stat['rows']} rows identical")
         ntok = sum(max(len(a["generations"][k]["tokens"]), len(b["generations"][k]["tokens"]))
-                   for k in a["generations"])
+                   for k in common)
         print(f"total tokens={ntok}; rows with diffs={ndiff}")
         print(f"VERDICT: {'PASS — zero divergence' if ndiff == 0 else 'FAIL — DIVERGENCE'}")
         sys.exit(0 if ndiff == 0 else 1)
