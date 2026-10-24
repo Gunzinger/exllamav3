@@ -17,8 +17,10 @@ results are then diffed with --compare (tokens) / --compare-state (recurrent poo
   PYTHONPATH=$PWD .venv-python tests/par_gdn.py --compare A.json B.json
   PYTHONPATH=$PWD .venv-python tests/par_gdn.py --compare-state A_512.pt B_512.pt
 
-State capture: for each --state-lens length a fresh Cache + Generator is created
-(virgin cleared slot-0 state) and one job with max_new_tokens=1 runs. A hook around
+State capture: for each --state-lens length one job with max_new_tokens=1 runs on
+the pre-load cache/generator (each Job starts a fresh GDNState at position 0,
+which clears the slot's pool rows, so every prefill starts from the zero state).
+A hook around
 gated_delta_rule._chunked_scan_rows snapshots every recurrent-layer pool right
 after the prefill calls — decode runs the fused step path, which never enters
 _chunked_scan_rows, so the snapshot IS the post-prefill state (plan 06
@@ -40,9 +42,11 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 
-def _run_job(gen, tokenizer, sampler, ids, max_new):
-    job_ids = ids.clone()
-    job = Job(input_ids=job_ids, max_new_tokens=max_new, sampler=sampler,
+def _run_job(gen, tokenizer, ids, max_new=1):
+    from exllamav3 import Job
+    from exllamav3.generator.sampler.presets import ComboSampler
+    sampler = ComboSampler(temperature=0.0, top_p=1.0, top_k=0)
+    job = Job(input_ids=ids.clone(), max_new_tokens=max_new, sampler=sampler,
               stop_conditions=[tokenizer.eos_token_id], identifier=0)
     gen.enqueue(job)
     toks = []
@@ -137,7 +141,7 @@ def main():
             ids = torch.tensor([qrows[i]["input_ids"]], dtype=torch.long)
             if ids.numel() > prompt_budget:
                 ids = ids[:, -prompt_budget:]
-            toks = _run_job(gen, tokenizer, sampler, ids, args.max_new)
+            toks = _run_job(gen, tokenizer, ids, args.max_new)
             generations[f"row{i}"] = {"in_len": int(ids.numel()), "tokens": toks}
             print(f"[gen] row{i}: in={int(ids.numel())} out={len(toks)} "
                   f"head={toks[:8]}", flush=True)
@@ -153,20 +157,18 @@ def main():
         with open(args.qbench) as f:
             base_ids = list(json.load(f)["rows"][0]["input_ids"])
         for target_len in args.state_lens:
-            # fresh Cache + Generator per length: virgin cleared slot-0 state, so
-            # the prefill starts from the zero state in both arms
-            scache = Cache(model, max_num_tokens=args.ctx, max_batch_size=1,
-                           max_history=0)
-            sgen = Generator(model, scache, tokenizer)
+            # the pre-load cache/generator is reused: each Job starts a fresh
+            # GDNState at position 0, which clears the slot's pool rows
+            # (GDNLayerState.clear), so the prefill starts from the zero state
             ids = base_ids[:]
             while len(ids) < target_len:
                 ids.extend(base_ids[1:])  # skip the BOS on repeats
             ids = torch.tensor([ids[:target_len]], dtype=torch.long)
             _STATE_SNAP.clear()
-            toks = _run_job(sgen, tokenizer, sampler, ids, 1)
+            toks = _run_job(gen, tokenizer, ids, 1)
 
             layers = {}
-            for idx, l in scache.get_all_recurrent_layers().items():
+            for idx, l in cache.get_all_recurrent_layers().items():
                 dtype, rows = _STATE_SNAP[id(l.recurrent_state)]
                 layers[int(idx)] = {
                     "pool_dtype": str(dtype).replace("torch.", ""),
@@ -180,7 +182,6 @@ def main():
             torch.save(payload, spath)
             print(f"[state] len={target_len}: {len(layers)} layers -> {spath}, "
                   f"token={toks}", flush=True)
-            del sgen, scache
             _STATE_SNAP.clear()
 
     model.unload()
