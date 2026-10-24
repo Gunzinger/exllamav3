@@ -2,7 +2,7 @@
 
 Status: **VERIFICATION COMPLETE 2026-10-24 — parity PASS everywhere, acceptance FAIL
 (serving delta ≈ 0 % both parts) → NO-GO for merge.** Branch `opt/glm-dsa-prefill`
-(worktree `opt-glm-dsa/`) stays unmerged. Head @ `dc138ff2` (this commit).
+(worktree `opt-glm-dsa/`) stays unmerged. Head @ `a6376d26`.
 
 ## Planes-reconstructability answer (summary, from the dev session)
 
