@@ -170,9 +170,12 @@ def main():
             layers = {}
             for n, (instance, l) in enumerate(
                     cache.get_all_recurrent_layers().items()):
+                if not hasattr(l, "recurrent_state"):
+                    continue  # PLE etc. — a different scan path, untouched here
                 dtype, rows = _STATE_SNAP[id(l.recurrent_state)]
                 layers[n] = {
                     "instance": str(instance),
+                    "cls": type(l).__name__,
                     "pool_dtype": str(dtype).replace("torch.", ""),
                     "recurrent": rows,
                     "conv": l.conv_state[:1, :, :l.module.conv_kernel_size]
@@ -242,8 +245,9 @@ def compare_states(a_path, b_path):
             nexact += 1
         if max(rec, conv) > gate:
             nfail += 1
-            print(f"  OVER-GATE layer {idx} [{la['pool_dtype']}]: recurrent="
-                  f"{rec:.3e} conv={conv:.3e} gate={gate:g}")
+            print(f"  OVER-GATE layer {idx} ({la.get('cls', '?')}, "
+                  f"{la['pool_dtype']}): recurrent={rec:.3e} conv={conv:.3e} "
+                  f"gate={gate:g}")
     print(f"layers={len(a['layers'])} bit-identical={nexact} "
           f"worst_recurrent={worst_rec:.3e} worst_conv={worst_conv:.3e} "
           f"over-gate={nfail}")
