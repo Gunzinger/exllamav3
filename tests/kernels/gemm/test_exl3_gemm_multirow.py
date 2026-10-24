@@ -25,7 +25,7 @@ import torch
 
 from exllamav3.ext import exllamav3_ext as ext
 from testlib import trellis as tref
-from testlib.exl3 import generator, rand_scale
+from testlib.exl3 import codebook_flags, generator, rand_scale
 
 REAL_MODEL_DIR = os.environ.get(
     "EXL3_TEST_REAL_MODEL",
@@ -95,7 +95,7 @@ def _cases():
 @torch.inference_mode()
 def test_multirow_band_vs_reference(device, s, K, cb, n, k):
     half = not float(K).is_integer()
-    mcg, mul1 = tref.codebook_flags(cb)
+    mcg, mul1 = codebook_flags(cb)
     seed = s * 100 + int(K * 2)
     g = generator(seed)
     p = tref.random_packed((k // 16) * (n // 16), K, np.random.default_rng(seed)) \
