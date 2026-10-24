@@ -1,7 +1,7 @@
 """
-Multi-row GEMM tiles on the RDNA/ROCm shape table (plan 03): the first shape with
-TILESIZE_M > 16 (index 5 on both backends; ROCm gains 32x16x128 where CUDA already has
-CUDA-table shapes 5-7). What is under test:
+Multi-row GEMM tiles on the RDNA/ROCm shape table (plan 03): every shape with
+TILESIZE_M > 16 (indices 5-7 on the ROCm table: 32x16x128, 48x16x128, 32x16x256; the CUDA
+table carries its own multi-row shapes at the same indices). What is under test:
 
 - the shape exists, is returned by exl3_gemm_num_kernel_shapes, and its row-tile predicate
   is the same upward-closed rule the 16-row shapes follow (excluded only while
@@ -39,12 +39,20 @@ def _n():
     return ext.exl3_gemm_num_kernel_shapes()
 
 
-def _multirow_shape():
-    """First shape whose row tile exceeds 16 (5 on both tables), or None"""
+def _multirow_shapes():
+    """Every shape whose row tile exceeds 16 (5, 6, 7 on the ROCm table), in index order"""
+    out = []
     for s in range(1, _n() + 1):
-        if next(m for m in range(1, 1025) if ext.exl3_gemm_shape_compat(s, m, 1536, 1536, 4)) > 1:
-            return s
-    return None
+        m_min = next((m for m in range(1, 1025)
+                      if ext.exl3_gemm_shape_compat(s, m, 1536, 1536, 4)), None)
+        if m_min and m_min > 1:
+            out.append(s)
+    return out
+
+
+def _multirow_shape():
+    s = _multirow_shapes()
+    return s[0] if s else None
 
 
 def _tiles(s):
@@ -82,11 +90,11 @@ def test_multirow_shape_exists():
 
 
 def _cases():
-    s = _multirow_shape()
-    if s is None:
-        return []
-    # 3inst at 4 bits (the dominant class) and mul1 at 2.5 bits (the 2.05 bpw class)
-    return [(s, 4, "3inst"), (s, 2.5, "mul1")]
+    # 3inst at 4 bits (the dominant class) and mul1 at 2.5 bits (the 2.05 bpw class),
+    # for every multi-row shape in the table
+    return [(s, K, cb)
+            for s in _multirow_shapes()
+            for (K, cb) in ((4, "3inst"), (2.5, "mul1"))]
 
 
 @pytest.mark.parametrize("s, K, cb", _cases())
@@ -103,6 +111,10 @@ def test_multirow_band_vs_reference(device, s, K, cb, n, k):
     suh, svh = rand_scale(k, g), rand_scale(n, g)
     tr = torch.from_numpy(p.copy()).to(device)
     W = tref.dequant(p, suh, svh, K, cb)
+    # a multi-row shape whose N tile does not divide this n (7's 256-wide tile vs n = 128/640)
+    # has no compatible row count at all
+    if not any(ext.exl3_gemm_shape_compat(s, m, k, n, int(K), half) for m in M_BAND):
+        pytest.skip(f"shape {s} tile does not divide {k}x{n}")
     ran = 0
     for m in M_BAND:
         if not ext.exl3_gemm_shape_compat(s, m, k, n, int(K), half):
@@ -116,21 +128,24 @@ def test_multirow_band_vs_reference(device, s, K, cb, n, k):
 
 
 @pytest.mark.rocm_only
+@pytest.mark.parametrize("s_new", _multirow_shapes() or [pytest.param(0, marks=pytest.mark.skip("no multi-row shape"))])
 @pytest.mark.parametrize("proj, k, n", (
     ("mlp.shared_expert.gate_proj", 2560, 640),
     ("mlp.shared_expert.down_proj", 640, 2560),
 ))
 @torch.inference_mode()
-def test_multirow_real_checkpoint(device, proj, k, n):
-    """Real 2.05 bpw tensors: the multirow tile stays in the M=16 numerics class and
-    agrees with the best 16-row tile on the same inputs"""
+def test_multirow_real_checkpoint(device, s_new, proj, k, n):
+    """Real 2.05 bpw tensors: the multirow tiles stay in the M=16 numerics class and
+    agree with the best 16-row tile on the same inputs"""
     from safetensors import safe_open
-    s_new = _multirow_shape()
-    # best 16-row shape that actually divides this projection's n (640 admits only N=128 tiles)
+    # best 16-row shape that actually divides this projection's n (640 admits only N=128
+    # tiles); checked at the tensors' bitrate class (K = 4)
     s_old = next(
         s for s in range(4, 0, -1)
-        if ext.exl3_gemm_shape_compat(s, 32, k, n, 2)
+        if ext.exl3_gemm_shape_compat(s, 32, k, n, 4)
     )
+    if not ext.exl3_gemm_shape_compat(s_new, 32, k, n, 4):
+        pytest.skip(f"shape {s_new} tile does not divide {k}x{n}")
     prefix = "model.language_model.layers.3." + proj
     shard = os.path.join(REAL_MODEL_DIR, "model-00001-of-00005.safetensors")
     if not os.path.exists(shard):

@@ -74,7 +74,7 @@ def time_forced(ext, trellis, suh, svh, mul1, K, in_f, out_f, m, shape):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--shapes", default="1,2,3,4,5", help="shape indices to time")
+    ap.add_argument("--shapes", default="1,2,3,4,5,6,7", help="shape indices to time")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     shapes = [int(s) for s in args.shapes.split(",")]
