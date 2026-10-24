@@ -70,15 +70,19 @@ run_arm() (
         log "rep $i/3 done (arm $name)"
     done
 
-    # decode check
-    MODE=latency REPS=3 MAX_TOKENS=256 \
-        LABEL="reconcache-${name}" bash "$LL/scripts/65_bench.sh"
+    # decode check (skip for prefill-only addendum runs)
+    if [[ "${PREFILL_ONLY:-0}" != "1" ]]; then
+        MODE=latency REPS=3 MAX_TOKENS=256 \
+            LABEL="reconcache-${name}" bash "$LL/scripts/65_bench.sh"
+    fi
 
     # warm-resend scenario (identical procedure in every arm)
-    PYTHONPATH="$WT" "$VENV" "$WT/tests/warm_resend.py" \
-        --base-url "http://127.0.0.1:$PORT" \
-        --label "reconcache-${name}" --knob "$mib" \
-        --out "$EVID/${TAG}-${name}-warmresend.json"
+    if [[ "${PREFILL_ONLY:-0}" != "1" ]]; then
+        PYTHONPATH="$WT" "$VENV" "$WT/tests/warm_resend.py" \
+            --base-url "http://127.0.0.1:$PORT" \
+            --label "reconcache-${name}" --knob "$mib" \
+            --out "$EVID/${TAG}-${name}-warmresend.json"
+    fi
 
     bash "$LL/scripts/60_serve.sh" stop
     sleep 5
