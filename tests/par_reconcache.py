@@ -49,6 +49,34 @@ NATURAL_PROMPTS = [
     "What is 17 * 23? Show your reasoning step by step, then state the final answer.",
 ]
 
+# Long/medium natural prompts prepended to every mode so the parity gate actually
+# exercises the cached tier: the first lesson of the 2026-10-24 run is that short
+# prompts (GLM natural prompts encode to 18-28 tokens) never reach the rows > 144
+# tier and the gate passes vacuously (cache_engaged=False). Rows coverage wanted:
+#   long  (~1500 words -> >2 chunks of >=1024 rows)  -> FUSED-Had basis (basis=1),
+#        the tier every real prefill chunk uses;
+#   medium (~250 words -> one 144 < rows < 1024 chunk) -> PLAIN rotated basis
+#        (basis=0);
+#   the short prompts + the 384-token decode steps cover rows <= 144 (GEMV tier,
+#        must never touch the cache).
+_WORDS = ("time person year way day thing man world life hand part child eye woman "
+          "place work week case point government company number group problem fact "
+          "system program question study business issue side kind head house service "
+          "friend father power hour game line end member law car city community name "
+          "president team minute idea kid body information back parent face others "
+          "level office door health person art war history party result change morning "
+          "reason research girl moment air teacher force education speed river cloud "
+          "stone forest engine window garden market price value quality measure shadow "
+          "signal current detail pattern feature process structure material surface "
+          "balance journey machine silence flight harbour version instance committee "
+          "proposal timeline dependency benchmark scheduler latency throughput provision")
+
+
+def _long_text(n_words: int, seed: int) -> str:
+    import random
+    rng = random.Random(seed)
+    return " ".join(rng.choice(_WORDS) for _ in range(n_words))
+
 KNOB = "EXL3_RECON_CACHE_MIB"
 
 
@@ -116,6 +144,13 @@ def run_generation(model_dir, mode, rows, max_new, ctx, qbench_path):
         prompts = [tokenizer.encode(p, add_bos=True, encode_special_tokens=True)
                    for p in NATURAL_PROMPTS]
     prompts = prompts[:rows]
+    # fused-path + plain-path coverage (see comment at _long_text); prepend so they
+    # are the FIRST rows of every pass
+    extra = [tokenizer.encode(_long_text(1500, 911), add_bos=True,
+                              encode_special_tokens=True),
+             tokenizer.encode(_long_text(250, 912), add_bos=True,
+                              encode_special_tokens=True)]
+    prompts = [torch.tensor([e], dtype=torch.long) for e in extra] + prompts
 
     stats_off = set_knob(None)
     print(f"[knob] off  stats={stats_off}", flush=True)
