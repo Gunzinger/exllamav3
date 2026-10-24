@@ -24,7 +24,11 @@
 namespace
 {
 
-constexpr uint64_t COOP_AUTOTUNE_VERSION = 4;
+// v5: the RDNA shape table gained the multi-row tiles (opt03). Tuned records are
+// candidate-set specific -- a winner recorded by a build whose table lacked shapes 5-7 would
+// shadow the fresh timing of the new candidates for every key tuned before the change -- so
+// the table change resalts every key.
+constexpr uint64_t COOP_AUTOTUNE_VERSION = 5;
 constexpr char DISK_CACHE_MAGIC[8] = { 'E', 'X', '3', 'A', 'T', 'U', 'N', 'E' };
 constexpr uint32_t DISK_CACHE_FORMAT = 1;
 

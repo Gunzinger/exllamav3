@@ -19,6 +19,7 @@ from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
+import os
 import time
 import threading
 from ..tokenizer import MMEmbedding
@@ -274,12 +275,12 @@ class Generator:
             self.draft_input_ids_pinned = torch.empty(
                 (max_batch_size, 1),
                 dtype = torch.long,
-                pin_memory = True
+                pin_memory = torch.cuda.is_available()
             )
             self.draft_ids_pinned = torch.empty(
                 (max_batch_size, self.max_draft_tokens),
                 dtype = torch.long,
-                pin_memory = True
+                pin_memory = torch.cuda.is_available()
             )
 
         # CPU page cache tier, and the disk tier behind it
@@ -684,6 +685,9 @@ class Generator:
             try:
                 job.prefill(results)
             except Exception as e:
+                if os.environ.get("EXL3_CPU_DEBUG_JOB"):
+                    import traceback
+                    traceback.print_exc()
                 self.reap_failed_job(job, e, results)
 
         # Recurrent checkpoints
@@ -1367,7 +1371,7 @@ class Generator:
         if buf is None or buf.shape[0] < rows:
             alloc_rows = max(rows, 32)
             shape = (alloc_rows,) if width is None else (alloc_rows, width)
-            buf = torch.zeros(shape, dtype = dtype, pin_memory = True)
+            buf = torch.zeros(shape, dtype = dtype, pin_memory = torch.cuda.is_available())
             self.staging_buffers[key] = buf
         return buf[:rows]
 
@@ -1543,7 +1547,7 @@ class Generator:
             pinned = self.sample_pinned
             if pinned is None or pinned.shape[0] < batch_size:
                 self.sample_pinned = pinned = torch.empty(
-                    (max(batch_size, 32), 1), dtype = torch.long, pin_memory = True
+                    (max(batch_size, 32), 1), dtype = torch.long, pin_memory = torch.cuda.is_available()
                 )
             launched = []
             for job, a, b in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
@@ -1557,7 +1561,8 @@ class Generator:
                     sampled = (pinned[k:k + 1],) + sampled[1:]
                 launched.append((job, token_logits, sampled))
             if launched:
-                torch.cuda.synchronize(batch_logits.device)
+                if batch_logits.device.type == "cuda":
+                    torch.cuda.synchronize(batch_logits.device)
                 # The sampled tokens are the next forward's inputs
                 self.model.prefetch_tokens([t for _, _, s in launched for t in s[0].view(-1).tolist()])
 

@@ -55,6 +55,45 @@ HIP_EXCLUDED_SOURCES = {
 }
 
 
+# Translation units of the CPU-only extension variant (no CUDA/HIP toolchain involved): the pure-C++
+# kernels, the CPU bindings module and the CUDA-runtime stand-ins stloader.cpp links against. The
+# Python surface of this variant is the subset bindings_cpu.cpp registers, plus HAS_* flags set
+# false for every GPU-only kernel family.
+CPU_SOURCES = [
+    "cpu_compat/cuda_stub.cpp",
+    "cpu/moe_mul1.cpp",
+    "cpu/linear_mul1.cpp",
+    "cpu/hc_mix_cpu.cpp",
+    "cpu/gdn_step_cpu.cpp",
+    "cpu/sdpa_paged_cpu.cpp",
+    "cpu/ple_step_cpu.cpp",
+    "cpu/ngram_cpu.cpp",
+    "cpu/router_cpu.cpp",
+    "cpu/fused_sampler_cpu.cpp",
+    "avx2_target.cpp",
+    "avx512_target.cpp",
+    "hadamard.cpp",
+    "sam.cpp",
+    "stloader.cpp",
+    "bindings_cpu.cpp",
+]
+
+
+def cpu_extension_sources(sources_dir: str) -> list[str]:
+    """Absolute paths of the extension's translation units for a CPU-only build (torch without a
+    CUDA or HIP runtime, or EXLLAMA_FORCE_CPU)."""
+    base = os.path.abspath(sources_dir)
+    return [os.path.join(base, rel) for rel in CPU_SOURCES]
+
+
+def cpu_compat_include_dir(sources_dir: str) -> str:
+    """Include directory of the CPU-only build's header stand-ins (cpu_compat/): a stub
+    cuda_runtime.h plus shadows of the c10/ATen CUDA headers stloader.cpp includes. cpp_extension
+    places extra_include_paths (-I) ahead of torch's own (-isystem), so passing this directory
+    makes those includes resolve to the stand-ins."""
+    return os.path.join(os.path.abspath(sources_dir), "cpu_compat")
+
+
 def is_hipify_output(filename: str) -> bool:
     """
     Files torch's hipify writes next to the sources on ROCm builds (foo.cu -> foo.hip, foo.cpp ->
@@ -74,9 +113,26 @@ def _hip_excluded(rel_path: str) -> bool:
     )
 
 
+# Fork-only translation units that must never enter a CUDA/HIP build. The GPU source sweep
+# below walks the whole extension tree, and these TUs exist for the CPU-only build alone:
+# bindings_cpu.cpp defines a second PYBIND11_MODULE (duplicate PyInit_exllamav3_ext),
+# cpu/ngram_cpu.cpp re-defines the ngram_* host functions ngram.cu already provides, and
+# cpu_compat/cuda_stub.cpp both duplicates stloader_cu.cu's conversion helpers and
+# re-defines the CUDA runtime API it exists to stand in for, which would hijack
+# stloader.cpp's in-module runtime calls. Upstream's cpu/moe_mul1.cpp stays in both builds:
+# the GPU extension compiles it for the CPU-MoE offload worker and the fork's
+# exl3_moe_cpu_forward_gated binding. Root TUs shared by both builds (avx*_target,
+# hadamard, sam, stloader) are not listed here and remain in the sweep.
+_CPU_ONLY_IN_GPU_SWEEP = frozenset(
+    rel for rel in CPU_SOURCES
+    if rel.startswith("cpu/") and rel != "cpu/moe_mul1.cpp"
+) | {"bindings_cpu.cpp"}
+
+
 def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
     """Absolute paths of the extension's translation units for a CUDA or ROCm build. Sources under
-    rocm/ (the RDNA kernels and the ROCm compat layer) belong to ROCm builds only."""
+    rocm/ (the RDNA kernels and the ROCm compat layer) belong to ROCm builds only; the fork's
+    CPU-only TUs (_CPU_ONLY_IN_GPU_SWEEP + cpu_compat/) belong to the CPU-only build only."""
     base = os.path.abspath(sources_dir)
     sources = []
     for root, _, files in os.walk(base):
@@ -84,6 +140,8 @@ def extension_sources(sources_dir: str, hip: bool = False) -> list[str]:
             path = os.path.join(root, file)
             rel = os.path.relpath(path, base).replace(os.sep, "/")
             if not file.endswith((".c", ".cpp", ".cu")) or is_hipify_output(file):
+                continue
+            if rel in _CPU_ONLY_IN_GPU_SWEEP or rel.startswith("cpu_compat/"):
                 continue
             if hip and _hip_excluded(rel):
                 continue

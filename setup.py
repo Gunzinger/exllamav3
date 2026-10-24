@@ -12,6 +12,16 @@ precompile = "EXLLAMA_NOCOMPILE" not in os.environ
 verbose = "EXLLAMA_VERBOSE" in os.environ
 ext_debug = "EXLLAMA_EXT_DEBUG" in os.environ
 
+# CPU-only torch (no CUDA/HIP runtime) or EXLLAMA_FORCE_CPU: there is no nvcc/hipcc to build the
+# CUDAExtension with, so skip the precompile like EXLLAMA_NOCOMPILE does; ext.py JIT-builds the
+# pure-C++ variant (cpu_extension_sources) at import instead
+cpu_only = bool(os.environ.get("EXLLAMA_FORCE_CPU")) or (
+    torch and torch_version.cuda is None and torch_version.hip is None
+)
+if precompile and cpu_only:
+    precompile = False
+    print("CPU-only torch detected; skipping extension precompile (exllamav3_ext is JIT-built at import time)")
+
 if precompile and not torch:
     print("Cannot precompile unless torch is installed.")
     print("To explicitly JIT install run EXLLAMA_NOCOMPILE= pip install <xyz>")

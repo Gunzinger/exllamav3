@@ -675,7 +675,10 @@ class Linear(Module):
         if self.pre_scale != 1.0:
             x *= self.pre_scale
         if self.softcap != 0.0:
-            ext.softcap(x, x, self.softcap)
+            if x.device.type == "cpu":
+                x.copy_((torch.tanh(x.float() / self.softcap) * self.softcap).to(x.dtype))
+            else:
+                ext.softcap(x, x, self.softcap)
         if self.post_scale != 1.0:
             x *= self.post_scale
         return x

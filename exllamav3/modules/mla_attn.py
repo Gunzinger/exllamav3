@@ -8,13 +8,19 @@ from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm
 from .layernorm import LayerNorm
 from ..model.model_tp_alloc import TPAllocation
-from .attention_fn.mla_triton import (
-    mla_attn_triton_decode,
-    mla_attn_triton_prefill,
-    mla_attn_triton_prefill_mha,
-    mla_absorb,
-    mla_unfold,
-)
+try:
+    from .attention_fn.mla_triton import (
+        mla_attn_triton_decode,
+        mla_attn_triton_prefill,
+        mla_attn_triton_prefill_mha,
+        mla_absorb,
+        mla_unfold,
+    )
+except ModuleNotFoundError:
+    # Hosts without triton (CPU-only builds): the MLA attention paths that call these raise at
+    # use time instead of failing the package import
+    mla_attn_triton_decode = mla_attn_triton_prefill = mla_attn_triton_prefill_mha = None
+    mla_absorb = mla_unfold = None
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
 from .attention_fn.smem import NoFittingConfig
 import os

@@ -7,7 +7,12 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
+try:
+    from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
+except ModuleNotFoundError:
+    # Hosts without triton (CPU-only builds): the SWA paths that call these raise at use time
+    # instead of failing the package import
+    paged_attn_triton_decode = paged_attn_triton_prefill = None
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext

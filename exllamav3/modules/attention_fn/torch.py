@@ -1,6 +1,8 @@
+import os
 import torch
 from .common import AttnArgs, AttnFn, get_non_causal_span_arglist
 from ...util.backend import sdpa_prefill, fa75_prefill
+from ...ext import exllamav3_ext as ext
 import torch.nn.functional as F
 
 
@@ -23,6 +25,16 @@ def _warn_sdpa_fallback():
         f"or `xformers` to improve performance.{col_default}"
     )
     has_warned_sdpa_fallback = True
+
+
+# C7 fused paged-attention kernel (ext.sdpa_paged_cpu): reads the KV pages in place, no gather.
+# Default-on (EXL3_CPU_SDPA_PAGED=0 restores the torch gather path); every ineligible shape
+# keeps the torch path below. Class relaxation accepted 2026-10-20 on KL evidence
+# (REPORT-lossy-features.md): median KL 2e-2 vs the torch path, argmax flips only at <=0.44-logit
+# top1-top2 margins, deterministic; +28 % tok/s and +29 % tokens/J at 1024-tok ctx, no-op past
+# the QSA sparse threshold (2051) where the kernel is not engaged
+_sdpa_paged_cpu = getattr(ext, "sdpa_paged_cpu_has_avx512", lambda: False)()
+_sdpa_paged_cpu_enable = os.environ.get("EXL3_CPU_SDPA_PAGED", "1") != "0"
 
 
 def fn_torch_sdpa_fallback_nocache(args: AttnArgs) -> torch.Tensor | None:
@@ -85,41 +97,68 @@ def fn_torch_sdpa_fallback_cache(args: AttnArgs) -> torch.Tensor | None:
         return torch.cat(o, dim = 1)
 
 
-def _torch_bighead_fallback(
-    q, k, v,
-    k_cache, v_cache,
-    block_table, cache_seqlens,
-    causal = False, softmax_scale = None,
-    window_size = None,
-    softcap = None,
-    chunk_size = 512,
-):
-    batch, seqlen_q, nheads, headdim = q.shape
-    _, seqlen_new, nheads_k, _ = k.shape
+def fn_torch_sdpa_cpu_paged(args: AttnArgs) -> torch.Tensor | None:
+    # CPU paged-cache attention (the QSA dense regime and every non-QSA cached layer on a
+    # CPU-only load): gather the sequence's pages into one contiguous buffer, append the new
+    # K/V rows in place and run chunked SDPA with the GQA broadcast. Declines everything else.
+    if (
+        args.q.device.type != "cpu" or
+        not args.has_kv_cache() or
+        args.q_cache is not None or
+        args.is_varlen() or
+        args.is_swa() or
+        args.window_right or
+        args.softcap != 0.0 or
+        args.sinks is not None or
+        args.non_causal_spans
+    ):
+        return None
+    if not args.causal:
+        return None
+    if (
+        _sdpa_paged_cpu_enable and _sdpa_paged_cpu and
+        args.q_len <= 8 and
+        16 <= args.dim <= 512 and args.dim % 16 == 0 and
+        args.num_q_heads <= 64 and
+        args.q.shape[1] == args.k.shape[1] and
+        args.q.dtype == torch.float16 and args.k.dtype == torch.float16 and
+        args.v.dtype == torch.float16 and args.k_cache.dtype == torch.float16 and
+        args.v_cache.dtype == torch.float16 and
+        args.q.is_contiguous() and args.k.is_contiguous() and args.v.is_contiguous() and
+        args.k_cache.is_contiguous() and args.v_cache.is_contiguous() and
+        args.block_table.is_contiguous()
+    ):
+        out = torch.empty_like(args.q)
+        ext.sdpa_paged_cpu(
+            args.q, args.k, args.v,
+            args.k_cache, args.v_cache,
+            args.block_table, args.cache_seqlens,
+            args.sm_scale, out,
+        )
+        _torch_paged_writeback(args.k, args.v, args.k_cache, args.v_cache,
+                               args.block_table, args.cache_seqlens)
+        return out
+    return _torch_paged_gather_sdpa(
+        args.q, args.k, args.v,
+        args.k_cache, args.v_cache,
+        args.block_table, args.cache_seqlens,
+        args.sm_scale,
+    )
+
+
+def _torch_paged_writeback(k, v, k_cache, v_cache, block_table, cache_seqlens):
+    """Write the new tokens' K/V rows into the paged cache (the tail of _torch_paged_gather_sdpa,
+    shared with the ext.sdpa_paged_cpu fast path)"""
+    batch, seqlen_new, _, _ = k.shape
     block_size = k_cache.shape[1]
 
-    turing = sdpa_prefill(q.device)
-    if not turing:
-        _warn_sdpa_fallback()
-    outputs = []
     for b in range(batch):
         seq_len = cache_seqlens[b].item()
         total_len = seq_len + seqlen_new
 
-        # Gather this sequence's blocks into a contiguous page-aligned buffer
         num_blocks_needed = (total_len + block_size - 1) // block_size
         phys_blocks = block_table[b, :num_blocks_needed]
-        k_buf, v_buf = _window_buffers(k_cache, v_cache, phys_blocks, nheads_k, headdim)
 
-        # In-place copy new tokens into the buffer
-        k_buf[seq_len:total_len] = k[b]
-        v_buf[seq_len:total_len] = v[b]
-
-        plain = not softcap and window_size in (None, -1, (-1, -1))
-        outputs.append(_attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
-                                      fa75 = turing and plain, group_gqa = turing))
-
-        # Write back only the new tokens to the paged cache
         first_block = seq_len // block_size
         last_block = (total_len - 1) // block_size
 
@@ -139,6 +178,48 @@ def _torch_bighead_fallback(
 
             k_cache[phys, off_start:off_end] = k[b, src_start:src_end]
             v_cache[phys, off_start:off_end] = v[b, src_start:src_end]
+
+
+def _torch_paged_gather_sdpa(
+    q, k, v,
+    k_cache, v_cache,
+    block_table, cache_seqlens,
+    softmax_scale,
+    causal = True,
+    chunk_size = 512,
+    window_size = None,
+    softcap = None,
+):
+    batch, seqlen_q, nheads, headdim = q.shape
+    _, seqlen_new, nheads_k, _ = k.shape
+    block_size = k_cache.shape[1]
+
+    turing = sdpa_prefill(q.device)
+    if not turing and q.device.type != "cpu":
+        # The GPU advice (triton/xformers) is meaningless on a CPU-only build, and on CPU the
+        # per-chunk calls below land on torch's AVX-512 flash CPU kernel anyway -- warn only
+        # where a big-head fallback would actually be taken
+        _warn_sdpa_fallback()
+
+    outputs = []
+    for b in range(batch):
+        seq_len = cache_seqlens[b].item()
+        total_len = seq_len + seqlen_new
+
+        # Gather this sequence's blocks into a contiguous page-aligned buffer
+        num_blocks_needed = (total_len + block_size - 1) // block_size
+        phys_blocks = block_table[b, :num_blocks_needed]
+        k_buf, v_buf = _window_buffers(k_cache, v_cache, phys_blocks, nheads_k, headdim)
+
+        # In-place copy new tokens into the buffer
+        k_buf[seq_len:total_len] = k[b]
+        v_buf[seq_len:total_len] = v[b]
+
+        plain = not softcap and window_size in (None, -1, (-1, -1))
+        outputs.append(_attend_window(q[b], k_buf, v_buf, total_len, causal, softmax_scale, chunk_size,
+                                      fa75 = turing and plain, group_gqa = turing))
+
+        _torch_paged_writeback(k, v, k_cache, v_cache, block_table, cache_seqlens)
 
     return torch.stack(outputs)
 
@@ -241,3 +322,21 @@ def _sdpa_chunks(q_b, k_buf, v_buf, total_len, seqlen_q, nheads, nheads_k, causa
         chunk_outputs.append(o.squeeze(0).transpose(0, 1))
 
     return torch.cat(chunk_outputs, dim = 0)
+
+
+
+def _torch_bighead_fallback(
+    q, k, v,
+    k_cache, v_cache,
+    block_table, cache_seqlens,
+    causal = False, softmax_scale = None,
+    window_size = None,
+    softcap = None,
+    chunk_size = 512,
+):
+    if not sdpa_prefill(q.device):
+        _warn_sdpa_fallback()
+    return _torch_paged_gather_sdpa(
+        q, k, v, k_cache, v_cache, block_table, cache_seqlens,
+        softmax_scale, causal, chunk_size,
+    )

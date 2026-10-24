@@ -23,6 +23,8 @@
 #include <vector>
 
 #ifdef __linux__
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <pthread.h>
 #include <sched.h>
 #else
@@ -120,6 +122,61 @@ inline float mul1_k_inv()
     // fp16 0x1eee
     static const float v = half_to_float(c10::Half(uint16_t(0x1eee), c10::Half::from_bits()));
     return v;
+}
+
+// EXL3_CPU_MUL1_PRF="<hint>:<bytes>[:<lines>]": prefetch sweep knob for the band-8 swizzled
+// weight stream (the lm_head-class decode GEMV, C3). hint t0/t1/t2/nta, byte distance ahead
+// of the stream pointer, optional line count (default 2 = one iteration's consumption).
+// Unset = the tuned default (single T1 line one k-row step ahead). Prefetches only affect
+// timing, never arithmetic: every setting is bit-identical to the default.
+struct Mul1Prf { bool on; int hint; int bytes; int lines; };
+inline const Mul1Prf& mul1_prf()
+{
+    static const Mul1Prf c = []{
+        Mul1Prf r{false, _MM_HINT_T1, 0, 2};
+        if (const char* e = std::getenv("EXL3_CPU_MUL1_PRF"))
+        {
+            char hint[8] = {};
+            int bytes = 0, lines = 2;
+            const int n = std::sscanf(e, "%7[^:]:%d:%d", hint, &bytes, &lines);
+            if (n >= 2 && bytes >= 64 && lines >= 1 && lines <= 16)
+            {
+                if (!std::strcmp(hint, "t0")) r.hint = _MM_HINT_T0;
+                else if (!std::strcmp(hint, "t1")) r.hint = _MM_HINT_T1;
+                else if (!std::strcmp(hint, "t2")) r.hint = _MM_HINT_T2;
+                else if (!std::strcmp(hint, "nta")) r.hint = _MM_HINT_NTA;
+                else return r;
+                r.on = true;
+                r.bytes = bytes;
+                r.lines = lines;
+            }
+        }
+        return r;
+    }();
+    return c;
+}
+
+// The band kernels' swz band-8 stream prefetch (one shared implementation). _mm_prefetch's
+// hint must be a compile-time constant, so the knob dispatches over constant cases (the
+// switch sits on the knob-enabled side of the branch; the default path stays the single
+// tuned T1 one-step-ahead prefetch)
+inline void mul1_prf_swz(const uint16_t* packed, size_t pf_step)
+{
+    const Mul1Prf prf = mul1_prf();
+    if (!prf.on)
+    {
+        _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+        return;
+    }
+    const char* p = reinterpret_cast<const char*>(packed) + prf.bytes;
+    for (int l = 0; l < prf.lines; ++l)
+        switch (prf.hint)
+        {
+            case _MM_HINT_T0: _mm_prefetch(p + l * 64, _MM_HINT_T0); break;
+            case _MM_HINT_T2: _mm_prefetch(p + l * 64, _MM_HINT_T2); break;
+            case _MM_HINT_NTA: _mm_prefetch(p + l * 64, _MM_HINT_NTA); break;
+            default: _mm_prefetch(p + l * 64, _MM_HINT_T1); break;
+        }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -767,7 +824,7 @@ void vnni_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 // Whole-group band on the swizzled layout: the k-stream is sequential, one line
                 // one step ahead is enough and the HW prefetcher follows the run (wider/farther
                 // measured neutral on K4, 7960X)
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -961,7 +1018,7 @@ void bw_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n0)
                 : packed_row + b * packed_size;
             if (mat.swz && band == 8)
             {
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -1224,7 +1281,7 @@ void vbmi_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout, int n
                 // Whole-group band on the swizzled layout: the k-stream is sequential, one line
                 // one step ahead is enough and the HW prefetcher follows the run (wider/farther
                 // measured neutral on K4, 7960X)
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -1312,7 +1369,7 @@ void vbmi_decode_band(const MoeCpuMatrix& mat, const PreparedIn& in, float* tout
             {
                 // Whole-group band on the swizzled layout: the k-stream is sequential, one line
                 // one step ahead is enough and the HW prefetcher follows the ru
-                _mm_prefetch(reinterpret_cast<const char*>(packed + pf_step), _MM_HINT_T1);
+                mul1_prf_swz(packed, pf_step);
             }
             else
             {
@@ -2354,6 +2411,15 @@ inline bool pin_threads_enabled()
     return v;
 }
 
+inline bool pool_futex_enabled()
+{
+    static const bool v = [] {
+        const char* e = std::getenv("EXL3_CPU_MOE_FUTEX");
+        return !(e && *e == '0');
+    }();
+    return v;
+}
+
 struct Pool
 {
     int spawned = 0;
@@ -2409,7 +2475,18 @@ struct Pool
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
                 if (++idle < 65536) { cpu_pause(); continue; }
 #ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (pool_futex_enabled())
+                {
+                    // Same park as hc_mix/gdn: futex on the dispatch word; every publisher
+                    // (run/prime/ensure) FUTEX_WAKEs after the store. The 50 us poll below
+                    // measured +1.6 W of serving-idle package power (E3, e3_idle_power.py)
+                    const uint64_t cmp = seen;
+                    syscall(SYS_futex, (void*) &dispatch, FUTEX_WAIT_PRIVATE, cmp, nullptr, nullptr, 0);
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone
@@ -2449,8 +2526,11 @@ struct Pool
             limit.store(n, std::memory_order_relaxed);
             while (live.load(std::memory_order_acquire) > n - 1)
             {
-#ifndef __linux__
+#ifdef __linux__
                 // Repeated: a worker that read the old limit may only now be parking
+                if (pool_futex_enabled())
+                    syscall(SYS_futex, (void*) &dispatch, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#else
                 WakeByAddressAll(&dispatch);
 #endif
                 std::this_thread::yield();
@@ -2465,7 +2545,10 @@ struct Pool
             ++spawned;
         }
         num_workers = n;
-        pin_self(0);   // worker 0 is the calling thread itself, never goes through worker_loop
+        // worker 0 is the calling thread itself, never goes through worker_loop; pin it once per
+        // thread (pthread_setaffinity_np per dispatch showed up across the ~170 linear calls/step)
+        static thread_local bool self_pinned = false;
+        if (!self_pinned) { pin_self(0); self_pinned = true; }
     }
 
     // A zero-participant generation wakes parked helpers without a completion barrier or
@@ -2473,7 +2556,10 @@ struct Pool
     void prime()
     {
         dispatch.store((++generation << DISPATCH_NW_BITS), std::memory_order_release);
-#ifndef __linux__
+#ifdef __linux__
+        if (pool_futex_enabled())
+            syscall(SYS_futex, (void*) &dispatch, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#else
         WakeByAddressAll(&dispatch);
 #endif
     }
@@ -2492,7 +2578,10 @@ struct Pool
         const uint64_t d0 = done.load(std::memory_order_acquire);
         ++generation;
         dispatch.store((generation << DISPATCH_NW_BITS) | (uint64_t) n, std::memory_order_release);
-#ifndef __linux__
+#ifdef __linux__
+        if (pool_futex_enabled())
+            syscall(SYS_futex, (void*) &dispatch, FUTEX_WAKE_PRIVATE, 0x7fffffff, nullptr, nullptr, 0);
+#else
         WakeByAddressAll(&dispatch);
 #endif
         f(c, 0, n);
@@ -3330,6 +3419,15 @@ void exl3_moe_cpu_pool_prime(int threads)
     g_pool.prime();
 }
 
+// M4: run a short auxiliary fn on the persistent pool (the router's logits phase) at the pool's
+// current size -- never shrinks or respawns it, and a not-yet-spawned pool runs serially
+void exl3_moe_cpu_pool_run(void (*fn)(void*, int, int), void* ctx, int n_req)
+{
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    if (g_pool.num_workers <= 1) { fn(ctx, 0, 1); return; }
+    g_pool.run(fn, ctx, n_req > 0 && n_req < g_pool.num_workers ? n_req : g_pool.num_workers);
+}
+
 // Exported pool self-test (helpers above live in the anonymous namespace of this TU)
 int64_t exl3_moe_cpu_pool_stress(int threads, int iters, int small, int spin)
 {
@@ -3598,6 +3696,526 @@ void exl3_moe_cpu_forward
     );
 }
 
+// The torch epilogue here runs entirely in fp32 (the shared gate Linear's out_dtype is float, so
+// g and sigmoid(g) are never rounded to half); this function is compiled at baseline ISA (no
+// target attribute), so the compiler cannot contract the mul-add into an fma and the schedule
+// survives as written. ATen's fp32 CPU sigmoid is size- and position-dependent: below 32 rows it
+// is the scalar libm kernel at every position, from 32 rows the vectorized Sleef u10 kernel
+// covers full 32-element super-chunks (two 16-wide vectors per loop step, AVX-512 build) and the
+// remainder returns to the scalar kernel. Both forms are reproduced here; the caller gates the
+// fast path on exl3_moe_cpu_has_avx512_bw so the split always lines up with torch's.
+
+M1_TARGET_BW
+static inline float gate_sigmoid_vec(float x)
+{
+    // Sleef u10 expf (sleefsimdsp.c xexpf), the exp ATen's vectorized sigmoid runs on AVX-512;
+    // bit-matched against torch.sigmoid on random, boundary and discriminator inputs
+    const __m512 d = _mm512_set1_ps(-x);
+    const __m512 rln2 = _mm512_set1_ps(1.442695040888963407359924681001892137426645954152985934135449406931f);
+    const __m512 nl2u = _mm512_set1_ps(-0.693145751953125f);
+    const __m512 nl2l = _mm512_set1_ps(-1.428606765330187045e-06f);
+    __m512i q = _mm512_cvtps_epi32(_mm512_roundscale_ps(_mm512_mul_ps(d, rln2),
+                                                        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m512 qf = _mm512_cvtepi32_ps(q);
+    __m512 s = _mm512_fmadd_ps(qf, nl2u, d);
+    s = _mm512_fmadd_ps(qf, nl2l, s);
+    __m512 u = _mm512_set1_ps(0.000198527617612853646278381f);
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.00139304355252534151077271f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.00833336077630519866943359f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.0416664853692054748535156f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.166666671633720397949219f));
+    u = _mm512_fmadd_ps(u, s, _mm512_set1_ps(0.5f));
+    u = _mm512_add_ps(_mm512_set1_ps(1.0f), _mm512_fmadd_ps(_mm512_mul_ps(s, s), u, s));
+    __m512i qh = _mm512_srai_epi32(q, 1);
+    __m512 u1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_add_epi32(qh, _mm512_set1_epi32(0x7f)), 23));
+    __m512 u2 = _mm512_castsi512_ps(_mm512_slli_epi32(
+        _mm512_add_epi32(_mm512_sub_epi32(q, qh), _mm512_set1_epi32(0x7f)), 23));
+    u = _mm512_mul_ps(_mm512_mul_ps(u, u1), u2);
+    u = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask(d, _mm512_set1_ps(-104.0f), _CMP_GE_OQ), u);
+    u = _mm512_mask_mov_ps(u, _mm512_cmp_ps_mask(d, _mm512_set1_ps(100.0f), _CMP_GT_OQ),
+                           _mm512_set1_ps(__builtin_inff()));
+    return _mm512_cvtss_f32(_mm512_div_ps(_mm512_set1_ps(1.0f), _mm512_add_ps(_mm512_set1_ps(1.0f), u)));
+}
+
+static inline float gate_sigmoid(float x, bool vectorized)
+{
+    if (vectorized)
+        return gate_sigmoid_vec(x);
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+at::Tensor exl3_moe_cpu_forward_gated
+(
+    int64_t handle,
+    const at::Tensor& x,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& routed,
+    const at::Tensor& gate_w,
+    int64_t num_threads,
+    bool half_out
+)
+{
+    TORCH_CHECK(x.device().is_cpu() && selected.device().is_cpu() && weights.device().is_cpu()
+                && routed.device().is_cpu() && gate_w.device().is_cpu(), "CPU MoE tensors must be on CPU");
+    TORCH_CHECK(x.scalar_type() == at::kHalf && weights.scalar_type() == at::kHalf
+                && routed.scalar_type() == at::kFloat && gate_w.scalar_type() == at::kFloat, "dtype mismatch");
+    TORCH_CHECK(x.dim() == 2 && selected.dim() == 2 && selected.size(0) == x.size(0)
+                && weights.sizes() == selected.sizes(),
+                "exl3_moe_cpu_forward_gated: x must be (rows, hidden), selected and weights (rows, top_k)");
+    TORCH_CHECK(x.is_contiguous() && selected.is_contiguous() && weights.is_contiguous()
+                && routed.is_contiguous() && gate_w.is_contiguous(),
+                "exl3_moe_cpu_forward_gated: tensors must be contiguous");
+    const MoeCpuLayer* layer = get_layer(handle);
+    TORCH_CHECK(x.size(1) == layer->hidden_size && routed.sizes() == x.sizes(),
+                "exl3_moe_cpu_forward_gated: x and routed must be (rows, hidden_size)");
+    TORCH_CHECK(gate_w.dim() == 2 && gate_w.size(0) == layer->hidden_size && gate_w.size(1) == 1,
+                "exl3_moe_cpu_forward_gated: gate_w must be (hidden_size, 1)");
+
+    const int m_total = static_cast<int>(x.size(0));
+    const int top_k = static_cast<int>(selected.size(-1));
+    const int H = layer->hidden_size;
+
+    // g as LinearFP16.forward computes it on CPU: the same fp32 at::matmul (fp32 accumulate, no
+    // intermediate rounding — the gate Linear's out_dtype is float)
+    at::Tensor g = at::matmul(x.to(at::kFloat), gate_w);
+    const float* gp = g.data_ptr<float>();
+    const at::Half* xp = reinterpret_cast<const at::Half*>(x.data_ptr());
+
+    std::vector<int32_t> sel32(static_cast<size_t>(m_total) * top_k);
+    if (selected.scalar_type() == at::kLong)
+    {
+        const int64_t* s = selected.data_ptr<int64_t>();
+        for (size_t i = 0; i < sel32.size(); ++i) sel32[i] = static_cast<int32_t>(s[i]);
+    }
+    else
+    {
+        TORCH_CHECK(selected.scalar_type() == at::kInt, "selected must be int32 or int64");
+        std::memcpy(sel32.data(), selected.data_ptr<int32_t>(), sel32.size() * 4);
+    }
+
+    std::vector<float> sh(static_cast<size_t>(m_total) * H);
+    exl3_moe_cpu_forward_raw
+    (
+        handle,
+        xp,
+        sel32.data(),
+        reinterpret_cast<const at::Half*>(weights.data_ptr()),
+        sh.data(),
+        m_total, top_k,
+        static_cast<int>(num_threads)
+    );
+
+    // sigmoid(g) in fp32 (the shared gate Linear's out_dtype is float), ATen's kernel split:
+    // scalar libm below 32 rows and on the remainder, Sleef u10 vectorized on the super-chunks
+    at::Tensor out = half_out ? at::empty({m_total, H}, x.options().dtype(at::kHalf)) : routed;
+    const float* rp = routed.data_ptr<float>();
+    at::Half* oh = half_out ? out.data_ptr<at::Half>() : nullptr;
+    float* of = half_out ? nullptr : out.data_ptr<float>();
+    const int n_vec = g_isa >= Isa::Bw ? (m_total / 32) * 32 : 0;
+    for (int r = 0; r < m_total; ++r)
+    {
+        const float sig = gate_sigmoid(gp[r], r < n_vec);
+        const float* shv = sh.data() + static_cast<size_t>(r) * H;
+        const float* rv = rp + static_cast<size_t>(r) * H;
+        if (half_out)
+        {
+            at::Half* ov = oh + static_cast<size_t>(r) * H;
+            for (int d = 0; d < H; ++d)
+                ov[d] = at::Half(rv[d] + shv[d] * sig);
+        }
+        else
+        {
+            float* ov = of + static_cast<size_t>(r) * H;
+            for (int d = 0; d < H; ++d)
+                ov[d] = rv[d] + shv[d] * sig;
+        }
+    }
+    return out;
+}
+
+// -------------------------------------------------------------------------------------------
+//   Standalone dense-linear forward (cpu/linear_mul1.cpp): one MoeCpuMatrix end to end
+// -------------------------------------------------------------------------------------------
+
+namespace {
+
+struct LinearArena
+{
+    std::vector<float> tin, tout;
+    std::vector<int32_t> splat, splat_dup;
+    std::vector<PreparedIn> prep;
+
+    static LinearArena& get()
+    {
+        static thread_local LinearArena arena;
+        return arena;
+    }
+};
+
+struct LinearCtx
+{
+    const MoeCpuMatrix* mat;
+    const at::Half* x;
+    float* out;
+    int m_total;
+    int row0;
+    int nc;
+    float* tout;
+    PreparedIn* prep;
+    int phase = 0;
+};
+
+void linear_phase(void* vctx, int worker, int num_workers)
+{
+    LinearCtx& c = *static_cast<LinearCtx*>(vctx);
+    const MoeCpuMatrix& mat = *c.mat;
+    const int n = mat.n;
+    const int nc_live = std::min(c.nc, (c.m_total - c.row0 + MAX_M - 1) / MAX_M);
+    switch (c.phase)
+    {
+        case 0:
+        {
+            static const int idx4[MAX_M] = {0, 1, 2, 3};
+            for (int j = worker; j < nc_live; j += num_workers)
+            {
+                const int r0 = c.row0 + j * MAX_M;
+                const int m = std::min(MAX_M, c.m_total - r0);
+                prepare_rows(mat, c.x + static_cast<size_t>(r0) * mat.k, nullptr, mat.k, idx4, m, c.prep[j]);
+            }
+            break;
+        }
+
+        case 1:
+        {
+            assign_gemvs(worker, num_workers, nc_live, n / 16, [&](int j, int t0, int t1)
+            {
+                run_rows(mat, c.prep[j], c.tout + static_cast<size_t>(j) * MAX_SLOTS * n, t0, t1);
+            });
+            break;
+        }
+
+        default:
+        {
+            if (c.m_total == 1)
+            {
+                // Decode: each worker owns complete 128-column blocks, transform and final store
+                // fused (mirrors forward_phase case 4)
+                const int nb = n / 128;
+                const int b0 = nb * worker / num_workers;
+                const int b1 = nb * (worker + 1) / num_workers;
+                for (int j = 0; j < nc_live; ++j)
+                {
+                    const int r0 = c.row0 + j * MAX_M;
+                    const int m = std::min(MAX_M, c.m_total - r0);
+                    float* t = c.tout + static_cast<size_t>(j) * MAX_SLOTS * n;
+                    fold_rows(t, c.prep[j], m, n, b0 * 128, b1 * 128);
+                    for (int r = 0; r < m; ++r)
+                        for (int block = b0 * 128; block < b1 * 128; block += 128)
+                        {
+                            float* v = t + static_cast<size_t>(r) * n + block;
+                            MoeCpuMatrix part = mat;
+                            part.n = 128;
+                            part.svh += block;
+                            if (part.bias) part.bias += block;
+                            transform_out(part, v, 1);
+                            std::memcpy(c.out + static_cast<size_t>(r0 + r) * n + block, v,
+                                        128 * sizeof(float));
+                        }
+                }
+            }
+            else
+            {
+                for (int j = worker; j < nc_live; j += num_workers)
+                {
+                    const int r0 = c.row0 + j * MAX_M;
+                    const int m = std::min(MAX_M, c.m_total - r0);
+                    float* t = c.tout + static_cast<size_t>(j) * MAX_SLOTS * n;
+                    fold_rows(t, c.prep[j], m, n, 0, n);
+                    transform_out(mat, t, m);
+                    for (int r = 0; r < m; ++r)
+                        std::memcpy(c.out + static_cast<size_t>(r0 + r) * n, t + static_cast<size_t>(r) * n,
+                                    static_cast<size_t>(n) * sizeof(float));
+                }
+            }
+            break;
+        }
+    }
+}
+
+int default_linear_threads()
+{
+    if (const char* e = std::getenv("EXL3_CPU_LINEAR_THREADS")) return std::max(1, std::atoi(e));
+    if (const char* e = std::getenv("EXL3_MOE_CPU_THREADS")) return std::max(1, std::atoi(e));
+    static const int t = []{
+        const CoreOrder co = physical_core_order();
+        const int n = co.n_phys > 0 ? co.n_phys
+                                    : std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
+        // Beyond ~10 workers the barrier-straggler cost outgrows the bandwidth gain on decode-shape
+        // GEMVs (8 > 10 > 12 measured on a 4+8 hybrid Zen 5 desktop; the moe expert phases' larger
+        // jobs keep their own default)
+        return std::min(n, 10);
+    }();
+    return t;
+}
+
+// Batched form (cpu/linear_mul1.cpp): several same-input matrices per pool round set, so a
+// projection group costs one dispatch sequence instead of one per matrix. Workspace per matrix,
+// grown but never shrunk, as in LinearArena
+struct BatchArena
+{
+    struct MatBufs
+    {
+        std::vector<float> tin, tout;
+        std::vector<int32_t> splat, splat_dup;
+        std::vector<PreparedIn> prep;
+    };
+    std::vector<MatBufs> mats;
+
+    static BatchArena& get()
+    {
+        static thread_local BatchArena arena;
+        return arena;
+    }
+};
+
+struct BatchCtx
+{
+    const std::vector<MoeCpuMatrix>* mats;
+    const at::Half* x;
+    float* const* outs;
+    int m_total;
+    int row0;
+    std::vector<int> nc;        // chunk capacity per matrix
+    std::vector<int> nc_live;   // chunks in flight for the current row block
+    std::vector<float*> tout;
+    std::vector<PreparedIn*> prep;
+    int phase = 0;
+};
+
+void linear_batch_phase(void* vctx, int worker, int num_workers)
+{
+    BatchCtx& c = *static_cast<BatchCtx*>(vctx);
+    const int nm = static_cast<int>(c.mats->size());
+    switch (c.phase)
+    {
+        case 0:
+        {
+            static const int idx4[MAX_M] = {0, 1, 2, 3};
+            int g = 0;
+            for (int i = 0; i < nm; ++i)
+            {
+                const MoeCpuMatrix& mat = (*c.mats)[i];
+                for (int j = 0; j < c.nc_live[i]; ++j, ++g)
+                {
+                    if (g % num_workers != worker) continue;
+                    const int r0 = c.row0 + j * MAX_M;
+                    const int m = std::min(MAX_M, c.m_total - r0);
+                    prepare_rows(mat, c.x + static_cast<size_t>(r0) * mat.k, nullptr, mat.k,
+                                 idx4, m, c.prep[i][j]);
+                }
+            }
+            break;
+        }
+
+        case 1:
+        {
+            for (int i = 0; i < nm; ++i)
+            {
+                const MoeCpuMatrix& mat = (*c.mats)[i];
+                const int n = mat.n;
+                if (c.m_total == 1)
+                {
+                    // Decode: gemv, fold, output transform and store fused per worker, over the
+                    // 8-tile-aligned (128-column) ranges assign_gemvs hands out. A worker's range
+                    // is self-contained (the fold's slot rows come from the same range), so no
+                    // barrier is needed between matrices
+                    assign_gemvs(worker, num_workers, c.nc_live[i], n / 16, [&](int j, int t0, int t1)
+                    {
+                        float* t = c.tout[i] + static_cast<size_t>(j) * MAX_SLOTS * n;
+                        const PreparedIn& p = c.prep[i][j];
+                        run_rows(mat, p, t, t0, t1);
+                        const int c0 = t0 * 16, c1 = t1 * 16;
+                        fold_rows(t, p, 1, n, c0, c1);
+                        float* out = c.outs[i];
+                        for (int block = c0; block < c1; block += 128)
+                        {
+                            float* v = t + block;
+                            MoeCpuMatrix part = mat;
+                            part.n = 128;
+                            part.svh += block;
+                            if (part.bias) part.bias += block;
+                            transform_out(part, v, 1);
+                            std::memcpy(out + block, v, 128 * sizeof(float));
+                        }
+                    });
+                }
+                else
+                {
+                    assign_gemvs(worker, num_workers, c.nc_live[i], n / 16, [&](int j, int t0, int t1)
+                    {
+                        run_rows(mat, c.prep[i][j],
+                                 c.tout[i] + static_cast<size_t>(j) * MAX_SLOTS * n, t0, t1);
+                    });
+                }
+            }
+            break;
+        }
+
+        default:
+        {
+            int g = 0;
+            for (int i = 0; i < nm; ++i)
+            {
+                const MoeCpuMatrix& mat = (*c.mats)[i];
+                const int n = mat.n;
+                float* out = c.outs[i];
+                for (int j = 0; j < c.nc_live[i]; ++j, ++g)
+                {
+                    if (g % num_workers != worker) continue;
+                    const int r0 = c.row0 + j * MAX_M;
+                    const int m = std::min(MAX_M, c.m_total - r0);
+                    float* t = c.tout[i] + static_cast<size_t>(j) * MAX_SLOTS * n;
+                    fold_rows(t, c.prep[i][j], m, n, 0, n);
+                    transform_out(mat, t, m);
+                    for (int r = 0; r < m; ++r)
+                        std::memcpy(out + static_cast<size_t>(r0 + r) * n,
+                                    t + static_cast<size_t>(r) * n,
+                                    static_cast<size_t>(n) * sizeof(float));
+                }
+            }
+            break;
+        }
+    }
+}
+} // namespace
+
+MoeCpuMatrix exl3_cpu_mul1_make_matrix
+(
+    const at::Tensor& trellis,
+    const at::Tensor& suh,
+    const at::Tensor& svh,
+    const at::Tensor* bias,
+    bool swizzled
+)
+{
+    return make_matrix(trellis, suh, svh, bias, swizzled);
+}
+
+void exl3_cpu_mul1_matrix_forward(const MoeCpuMatrix& mat, const at::Half* x, int m_total, float* out, int threads)
+{
+    if (m_total <= 0) return;
+    if (threads <= 0) threads = default_linear_threads();
+
+    const int nc_total = (m_total + MAX_M - 1) / MAX_M;
+    // Chunk-workspace cap (~128 MB of GEMV output): bounds the arena on wide projections (lm_head)
+    // while keeping prefill row blocks large enough to amortize the per-phase pool barriers
+    const int nc = std::max(1, static_cast<int>(std::min<size_t>(
+        nc_total, (size_t(128) << 20) / (size_t(MAX_SLOTS) * mat.n * sizeof(float)))));
+
+    LinearArena& ar = LinearArena::get();
+    auto grow = [](auto& v, size_t n_) { if (v.size() < n_) v.resize(n_); };
+    grow(ar.tin, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+    grow(ar.splat, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+    grow(ar.splat_dup, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+    grow(ar.tout, static_cast<size_t>(nc) * MAX_SLOTS * mat.n);
+    grow(ar.prep, nc);
+
+    LinearCtx ctx;
+    ctx.mat = &mat;
+    ctx.x = x;
+    ctx.out = out;
+    ctx.m_total = m_total;
+    ctx.nc = nc;
+    ctx.tout = ar.tout.data();
+    ctx.prep = ar.prep.data();
+    for (int j = 0; j < nc; ++j)
+        ctx.prep[j] = { ar.tin.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k,
+                        ar.splat.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k,
+                        ar.splat_dup.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k, {}, {} };
+
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    g_pool.ensure(threads);
+    for (int row0 = 0; row0 < m_total; row0 += nc * MAX_M)
+    {
+        ctx.row0 = row0;
+        for (int phase = 0; phase < 3; ++phase)
+        {
+            ctx.phase = phase;
+            g_pool.run(&linear_phase, &ctx);
+        }
+    }
+}
+
+void exl3_cpu_mul1_batch_forward
+(
+    const std::vector<MoeCpuMatrix>& mats,
+    const at::Half* x,
+    int m_total,
+    float* const* outs,
+    int threads
+)
+{
+    const int nm = static_cast<int>(mats.size());
+    if (m_total <= 0 || nm == 0) return;
+    if (threads <= 0) threads = default_linear_threads();
+
+    BatchArena& ar = BatchArena::get();
+    if (static_cast<int>(ar.mats.size()) < nm) ar.mats.resize(nm);
+
+    BatchCtx ctx;
+    ctx.mats = &mats;
+    ctx.x = x;
+    ctx.outs = outs;
+    ctx.m_total = m_total;
+    ctx.nc.resize(nm);
+    ctx.nc_live.resize(nm);
+    ctx.tout.resize(nm);
+    ctx.prep.resize(nm);
+
+    // Row blocks advance together for all matrices, so a wide matrix bounds the block size
+    int block_rows = std::numeric_limits<int>::max();
+    for (int i = 0; i < nm; ++i)
+    {
+        const MoeCpuMatrix& mat = mats[i];
+        const int nc_total = (m_total + MAX_M - 1) / MAX_M;
+        const int nc = std::max(1, static_cast<int>(std::min<size_t>(
+            nc_total, (size_t(128) << 20) / (size_t(MAX_SLOTS) * mat.n * sizeof(float)))));
+        ctx.nc[i] = nc;
+        block_rows = std::min(block_rows, nc * MAX_M);
+        BatchArena::MatBufs& b = ar.mats[i];
+        auto grow = [](auto& v, size_t n_) { if (v.size() < n_) v.resize(n_); };
+        grow(b.tin, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+        grow(b.splat, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+        grow(b.splat_dup, static_cast<size_t>(nc) * MAX_SLOTS * mat.k);
+        grow(b.tout, static_cast<size_t>(nc) * MAX_SLOTS * mat.n);
+        grow(b.prep, nc);
+        ctx.tout[i] = b.tout.data();
+        ctx.prep[i] = b.prep.data();
+        for (int j = 0; j < nc; ++j)
+            b.prep[j] = { b.tin.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k,
+                          b.splat.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k,
+                          b.splat_dup.data() + static_cast<size_t>(j) * MAX_SLOTS * mat.k, {}, {} };
+    }
+
+    // Decode rows fuse the gemv and output phases into one dispatch (self-contained column
+    // ranges per worker); larger row blocks keep the 3-phase form
+    const int num_phases = m_total == 1 ? 2 : 3;
+    std::lock_guard<std::mutex> lock(g_pool_mutex);
+    g_pool.ensure(threads);
+    for (int row0 = 0; row0 < m_total; row0 += block_rows)
+    {
+        ctx.row0 = row0;
+        for (int i = 0; i < nm; ++i)
+            ctx.nc_live[i] = std::min(ctx.nc[i], (m_total - row0 + MAX_M - 1) / MAX_M);
+        for (int phase = 0; phase < num_phases; ++phase)
+        {
+            ctx.phase = phase;
+            g_pool.run(&linear_batch_phase, &ctx);
+        }
+    }
+}
+
 #else  // !x86: EXL3_AARCH64_STUB — CPU MoE offload kernels are AVX-only; stubbed on this architecture
 #include "moe_mul1.h"
 #include <torch/extension.h>
@@ -3622,4 +4240,16 @@ int64_t exl3_moe_cpu_make_layer(
 void exl3_moe_cpu_free_layer(int64_t) {}
 void exl3_moe_cpu_forward_raw(int64_t, const at::Half*, const int32_t*, const at::Half*, float*, int, int, int) { NO_MOE_CPU(); }
 void exl3_moe_cpu_forward(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t) { NO_MOE_CPU(); }
+at::Tensor exl3_moe_cpu_forward_gated(int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, bool)
+{
+    NO_MOE_CPU();
+    return {};
+}
+MoeCpuMatrix exl3_cpu_mul1_make_matrix(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor*, bool)
+{
+    NO_MOE_CPU();
+    return MoeCpuMatrix{};
+}
+void exl3_cpu_mul1_matrix_forward(const MoeCpuMatrix&, const at::Half*, int, float*, int) { NO_MOE_CPU(); }
+void exl3_cpu_mul1_batch_forward(const std::vector<MoeCpuMatrix>&, const at::Half*, int, float* const*, int) { NO_MOE_CPU(); }
 #endif
