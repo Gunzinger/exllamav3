@@ -97,6 +97,12 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
         if (K <= 4)      { if (shape == 4) score += 50000; }
         else if (K <= 6) { if (shape == 3) score += 30000; }
         else             { if (shape <= 2) score += 20000; }
+        // opt03: a wider row tile decodes the same B fragments for more rows (the CUDA table's
+        // shapes 5-7 rationale). Once m spans more than one 16-row pass, weight the row tile next
+        // to the N-tile term. The timing autotuner is the primary selector; this only ranks the
+        // static fallback (the force_num_sms path) consistently with it.
+        if (size_m > 16)
+            score += (long long) (exl3_gemm_tilesize_m[shape] / 16) * 8000;
 
         if (score > best_score) { best_score = score; best_shape = shape; }
     }

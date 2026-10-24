@@ -23,6 +23,7 @@ namespace cg = cooperative_groups;
 int exl3_gemm_tilesize_k_g[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n_g[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim_g[] = {EXL3_GEMM_BLOCKDIM};
+int exl3_gemm_tilesize_m_g[] = {EXL3_GEMM_TILESIZE_M};
 
 /*
 EXL3 matmul, A @ B -> C
@@ -200,6 +201,26 @@ int exl3_gemm_gr
     }
 
 #if defined(USE_ROCM)
+    // opt03: pin the GEMM shape for A/B runs -- EXL3_GEMM_SHAPE = shape index (1..N), or
+    // EXL3_GEMM_SHAPE_M = row-tile size (16, 32, ...; first shape with that row tile). Applied
+    // as force_shape_idx, which skips the GEMV paths and the timing autotuner; divisibility and
+    // shared-memory fit are TORCH_CHECKed by select_exl3_gemm_kernel. Unset = stock behavior.
+    // Read once per process: the autotune cache and graph capture assume a stable shape for the
+    // lifetime of the caller, so arms are separate process runs (same build, env flip only).
+    static const int env_shape = []
+    {
+        const char* e = std::getenv("EXL3_GEMM_SHAPE");
+        if (e && atoi(e) > 0) return atoi(e);
+        if ((e = std::getenv("EXL3_GEMM_SHAPE_M")))
+        {
+            int m = atoi(e);
+            for (int s = 1; s <= EXL3_GEMM_NUM_SHAPES; ++s)
+                if (exl3_gemm_tilesize_m_g[s] == m) return s;
+        }
+        return 0;
+    }();
+    if (env_shape > 0 && force_shape_idx <= 0) force_shape_idx = env_shape;
+
     // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
     // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
     if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8

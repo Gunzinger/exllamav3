@@ -85,20 +85,25 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 // RDNA (64 KB of LDS per workgroup): 256 threads, TILESIZE_K 16 and three or four stages keep every
 // bitrate inside the budget; TILESIZE_N must be a multiple of 128 and of 16 x the warp count (the
-// WMMA inner has no remainder pass over N-blocks). The inner implements TILESIZE_M == 16 only.
+// WMMA inner has no remainder pass over N-blocks). Shape 5 is the RDNA counterpart of the CUDA
+// table's multi-row shapes: all 32 rows of the tile share each decoded B fragment, where the
+// 16-row shapes read and decode the whole weight matrix again for every 16 rows. N = 128 with
+// four stages keeps every bitrate inside the budget (35.3 KB at 8 bits; the 32 x 128 output tile
+// staged for the fused output Hadamard is the dominant term at 16 KB).
 #define EXL3_GEMM_SHAPE_1     16,     16,    128,     4,     3
 #define EXL3_GEMM_SHAPE_2     16,     16,    256,     3,     3
 #define EXL3_GEMM_SHAPE_3     16,     16,    384,     3,     3
 #define EXL3_GEMM_SHAPE_4     16,     16,    512,     3,     3
+#define EXL3_GEMM_SHAPE_5     32,     16,    128,     4,     3
 
-#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16
-#define EXL3_GEMM_TILESIZE_K  0, 16, 16, 16, 16
-#define EXL3_GEMM_TILESIZE_N  0, 128, 256, 384, 512
-#define EXL3_GEMM_BLOCKDIM    0, 256, 256, 256, 256
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32
+#define EXL3_GEMM_TILESIZE_K  0, 16, 16, 16, 16, 16
+#define EXL3_GEMM_TILESIZE_N  0, 128, 256, 384, 512, 128
+#define EXL3_GEMM_BLOCKDIM    0, 256, 256, 256, 256, 256
 
-#define EXL3_GEMM_NUM_SHAPES 4
+#define EXL3_GEMM_NUM_SHAPES 5
 #define EXL3_GEMM_FOREACH_SHAPE(X, ...) \
-    X(1, __VA_ARGS__) X(2, __VA_ARGS__) X(3, __VA_ARGS__) X(4, __VA_ARGS__)
+    X(1, __VA_ARGS__) X(2, __VA_ARGS__) X(3, __VA_ARGS__) X(4, __VA_ARGS__) X(5, __VA_ARGS__)
 
 // Row stride, in halves, of the per-warp B staging tile the RDNA inner transposes dequantized
 // fragments through on the way to WMMA layout. 18 rather than 17: at 17 the adjacent active-lane
