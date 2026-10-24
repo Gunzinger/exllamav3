@@ -1,10 +1,13 @@
 # RESUME — Plan 04, reconstruct-once FP16 shadow cache (`opt/recon-cache`)
 
-## Status: code complete, unit-tested (mocked), parity + benches DEFERRED (no network / no model
-load / no GPU server allowed in this window; host shutdown imminent).
+## Status: VERIFICATION COMPLETE (2026-10-24) — parity PASS, benches DONE, acceptance FAIL,
+## verdict NO-GO (keep unmerged; knob default-off). Full results, probe evidence and rationale:
+## PLAN-opt-reconcache.md in this worktree.
 
 Branch `opt/recon-cache` (off `cpu-only` @ bc731a5e), python-only changes — no extension rebuild
-needed or performed.
+needed or performed. Verification added the drivers `tests/par_reconcache.py`,
+`tests/warm_resend.py`, `tests/bench_reconcache.sh`, `tests/collect_reconcache.py`,
+`tests/probe_reconcache_hits.py` (commit range `12795abf`..`193e45bb`).
 
 ## What landed
 
